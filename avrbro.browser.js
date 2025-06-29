@@ -158,7 +158,8 @@ async flashHex(hexText, onProgress) {
   const lines = hexText.split(/\r?\n/);
   let curr = 0;
   let buff = [];
-  const pageSize = 128; // 👈 adjust as needed
+  const pageSize = 128;
+  const bootloaderStart = 0x7800; // ⛔ Modify if your bootloader starts elsewhere
 
   for (const l of lines) {
     if (!l.startsWith(":")) continue;
@@ -166,7 +167,12 @@ async flashHex(hexText, onProgress) {
     const addr = parseInt(l.substr(3, 4), 16);
     const type = parseInt(l.substr(7, 2), 16);
     if (type === 1) break; // EOF
-    if (type !== 0) continue; // not data
+    if (type !== 0) continue; // Not data
+
+    //  Bootloader protection
+    if (addr >= bootloaderStart) {
+      throw new Error(`HEX file tries to write to 0x${addr.toString(16)} (bootloader region).`);
+    }
 
     const data = [];
     for (let j = 0; j < len; j++) {
@@ -174,7 +180,6 @@ async flashHex(hexText, onProgress) {
     }
 
     if (addr !== curr + buff.length) {
-      // flush current buffer into pages
       while (buff.length) {
         const chunk = buff.splice(0, pageSize);
         pages.push([curr, chunk]);
@@ -186,7 +191,6 @@ async flashHex(hexText, onProgress) {
     buff.push(...data);
   }
 
-  // flush remaining
   while (buff.length) {
     const chunk = buff.splice(0, pageSize);
     pages.push([curr, chunk]);
