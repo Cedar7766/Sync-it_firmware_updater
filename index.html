@@ -2,76 +2,84 @@
 <html>
 <head>
   <meta charset="utf-8">
-  <title>MCU Firmware Uploader</title>
+  <title>Firmware Uploader</title>
   <style>
-    body { font-family: sans-serif; margin: 2em; text-align: center; }
-    #progress { width: 100%; margin-top: 1em; }
-    #status { margin: 1em 0; color: #333; }
-    #filename { font-weight: bold; }
+    body { font-family: sans-serif; padding: 2em; }
+    h1 { margin-bottom: 0.5em; }
+    #firmwareSelector { margin-right: 1em; }
+    #status { margin-top: 1em; color: darkred; }
   </style>
 </head>
 <body>
-  <h1>Firmware Uploader</h1>
-
-  <p>Firmware file: <span id="filename">loading...</span></p>
-
-  <button id="connect">Connect & Upload</button>
-  <progress id="progress" value="0" max="100" hidden></progress>
-
-  <p id="status"></p>
+  <h1>AVR Firmware Uploader</h1>
+  <label for="firmwareSelector">Choose firmware:</label>
+  <select id="firmwareSelector">
+    <option>Loading...</option>
+  </select>
+  <br><br>
+  <button id="uploadBtn">Connect & Upload</button>
+  <progress id="progress" value="0" max="100" style="display: block; width: 300px;"></progress>
+  <div id="status"></div>
 
   <script src="avrbro.browser.js"></script>
   <script>
-    const firmwareURL = "./firmware/firmware.hex";
-    const firmwareName = firmwareURL.split("/").pop();
+    const selector = document.getElementById('firmwareSelector');
+    const uploadBtn = document.getElementById('uploadBtn');
+    const status = document.getElementById('status');
+    const progress = document.getElementById('progress');
 
-    const connectBtn = document.getElementById("connect");
-    const progressBar = document.getElementById("progress");
-    const status = document.getElementById("status");
-    const filename = document.getElementById("filename");
+    let selectedFirmware = null;
 
-    let firmwareText = null;
-
-    filename.textContent = "loading...";
-
-    // Load the firmware on page load
-    fetch(firmwareURL)
-      .then(res => {
-        if (!res.ok) throw new Error("Failed to fetch firmware.hex");
-        return res.text();
-      })
-      .then(text => {
-        firmwareText = text;
-        filename.textContent = firmwareName;
-        status.textContent = "Firmware loaded";
+    // Load manifest
+    fetch('firmware/manifest.json')
+      .then(r => r.json())
+      .then(files => {
+        selector.innerHTML = "";
+        files.forEach(file => {
+          const option = document.createElement('option');
+          option.value = `firmware/${file}`;
+          option.textContent = file;
+          selector.appendChild(option);
+        });
+        selectedFirmware = selector.value;
       })
       .catch(err => {
-        status.textContent = "⚠️ " + err.message;
-        connectBtn.disabled = true;
+        selector.innerHTML = "<option disabled>Error loading firmware list</option>";
+        status.textContent = "❌ Could not load manifest.json";
       });
 
-    connectBtn.onclick = async () => {
+    selector.onchange = () => {
+      selectedFirmware = selector.value;
+    };
+
+    uploadBtn.onclick = async () => {
       status.textContent = "";
-      progressBar.hidden = false;
-      progressBar.value = 0;
+      progress.value = 0;
 
       try {
+        // 1. Open serial port and reset
         const port = await navigator.serial.requestPort();
         await port.open({ baudRate: 1200 });
         await new Promise(r => setTimeout(r, 250));
         await port.close();
 
+        // 2. Reconnect at bootloader baud rate
         await port.open({ baudRate: 57600 });
         const serial = new AvrSerial(port);
         await serial.open();
 
         const uploader = new STK500v1(serial);
-        await uploader.flashHex(firmwareText, pct => progressBar.value = pct);
 
+        // 3. Fetch firmware hex
+        if (!selectedFirmware) throw new Error("No firmware selected");
+        const firmwareText = await fetch(selectedFirmware).then(r => r.text());
+
+        // 4. Flash it
+        await uploader.flashHex(firmwareText, pct => progress.value = pct);
         status.textContent = "✅ Upload complete!";
-        await serial.close();
       } catch (e) {
-        status.textContent = "❌ " + e.message;
+        status.textContent = "❌ Upload failed: " + e.message;
+        console.error(e);
       }
     };
   </script>
