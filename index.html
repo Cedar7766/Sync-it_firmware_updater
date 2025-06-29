@@ -55,36 +55,47 @@ fetch('firmware/manifest.json')
       selectedFirmware = selector.value;
     };
 
-    uploadBtn.onclick = async () => {
-      status.textContent = "";
-      progress.value = 0;
+uploadBtn.onclick = async () => {
+  status.textContent = "";
+  progress.value = 0;
 
-      try {
-        // 1. Open serial port and reset
-        const port = await navigator.serial.requestPort();
-        await port.open({ baudRate: 1200 });
-        await new Promise(r => setTimeout(r, 250));
-        await port.close();
+  let port = null;
+  let serial = null;
 
-        // 2. Reconnect at bootloader baud rate
-        await port.open({ baudRate: 57600 });
-        const serial = new AvrSerial(port);
-        await serial.open();
+  try {
+    // 1. Open serial port and reset
+    port = await navigator.serial.requestPort();
+    await port.open({ baudRate: 1200 });
+    await new Promise(r => setTimeout(r, 250));
+    await port.close();
 
-        const uploader = new STK500v1(serial);
+    // 2. Reconnect at bootloader baud rate
+    await port.open({ baudRate: 57600 });
+    serial = new AvrSerial(port);
+    await serial.open();
 
-        // 3. Fetch firmware hex
-        if (!selectedFirmware) throw new Error("No firmware selected");
-        const firmwareText = await fetch(selectedFirmware).then(r => r.text());
+    const uploader = new STK500v1(serial);
 
-        // 4. Flash it
-        await uploader.flashHex(firmwareText, pct => progress.value = pct);
-        status.textContent = "✅ Upload complete!";
-      } catch (e) {
-        status.textContent = "❌ Upload failed: " + e.message;
-        console.error(e);
-      }
-    };
+    // 3. Fetch firmware hex
+    if (!selectedFirmware) throw new Error("No firmware selected");
+    const firmwareText = await fetch(selectedFirmware).then(r => r.text());
+
+    // 4. Flash it
+    await uploader.flashHex(firmwareText, pct => progress.value = pct);
+    status.textContent = "✅ Upload complete!";
+  } catch (e) {
+    status.textContent = "❌ Upload failed: " + e.message;
+    console.error(e);
+  } finally {
+    // Always close serial port to prevent it getting stuck
+    try {
+      if (serial) await serial.close();
+      else if (port && port.readable && port.writable) await port.close();
+    } catch (err) {
+      console.warn("⚠️ Failed to fully close serial port:", err);
+    }
+  }
+};
   </script>
 </body>
 </html>
