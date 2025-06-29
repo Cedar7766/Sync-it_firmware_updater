@@ -1,0 +1,26 @@
+name: Generate manifest.json
+
+on:
+  push:
+    paths:
+      - 'firmware/*.hex'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Generate manifest.json
+        run: |
+          cd firmware
+          ls *.hex | jq -R . | jq -s . > manifest.json
+
+      - name: Commit manifest.json
+        run: |
+          git config --global user.name "GitHub Action"
+          git config --global user.email "action@github.com"
+          git add firmware/manifest.json
+          git commit -m "Auto-update manifest.json" || echo "No changes"
+          git push
