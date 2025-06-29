@@ -58,7 +58,10 @@ fetch('firmware/manifest.json')
 uploadBtn.onclick = async () => {
   status.textContent = "";
   progress.value = 0;
-
+if (!("serial" in navigator)) {
+  status.textContent = "❌ Web Serial API not supported. Please use a supported browser (Chrome/Edge) over HTTPS.";
+  return;
+}
   let port = null;
   let serial = null;
 
