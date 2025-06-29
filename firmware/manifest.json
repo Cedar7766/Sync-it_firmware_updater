@@ -1,4 +1,6 @@
 [
+  "Blink.hex",
+  "Blink.ino.with_bootloader.standard.hex",
   "Sync-it_Plus_3.40_template.ino.with_bootloader.standard.hex",
   "Sync-it_Plus_3.40_template_white_screen.ino.standard.hex"
 ]
