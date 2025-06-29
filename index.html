@@ -31,22 +31,25 @@
     let selectedFirmware = null;
 
     // Load manifest
-    fetch('firmware/manifest.json')
-      .then(r => r.json())
-      .then(files => {
-        selector.innerHTML = "";
-        files.forEach(file => {
-          const option = document.createElement('option');
-          option.value = `firmware/${file}`;
-          option.textContent = file;
-          selector.appendChild(option);
-        });
-        selectedFirmware = selector.value;
-      })
-      .catch(err => {
-        selector.innerHTML = "<option disabled>Error loading firmware list</option>";
-        status.textContent = "❌ Could not load manifest.json";
-      });
+fetch('firmware/manifest.json')
+  .then(r => {
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    return r.json();
+  })
+  .then(files => {
+    selector.innerHTML = "";
+    files.forEach(file => {
+      const option = document.createElement('option');
+      option.value = `firmware/${file}`;
+      option.textContent = file;
+      selector.appendChild(option);
+    });
+    selectedFirmware = selector.value;
+  })
+  .catch(err => {
+    selector.innerHTML = "<option disabled>Error loading firmware list</option>";
+    status.textContent = "❌ Could not load manifest.json: " + err.message;
+  });
 
     selector.onchange = () => {
       selectedFirmware = selector.value;
