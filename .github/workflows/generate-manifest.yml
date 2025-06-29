@@ -6,6 +6,9 @@ on:
       - 'firmware/*.hex'
       - '.github/workflows/gen-manifest.yml'
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
