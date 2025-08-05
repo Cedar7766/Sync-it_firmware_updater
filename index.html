@@ -8,23 +8,22 @@
     h1 { margin-bottom: 0.5em; }
     #firmwareSelector { margin-right: 1em; }
     #status { margin-top: 1em; color: darkred; }
+    #fileInput { margin-top: 0.5em; display: block; }
   </style>
 </head>
 <body>
   <h1>Sync-it Firmware Uploader</h1>
-  <label for="firmwareSelector">Choose firmware:</label>
+
+  <label for="firmwareSelector">Choose firmware from list:</label>
   <select id="firmwareSelector">
     <option>Loading...</option>
   </select>
-  <br><br>
-<label for="fileInput">...or choose a file from your computer:</label>
-<input type="file" id="fileInput" accept=".hex">
+
+  <label for="fileInput">...or upload your own HEX file:</label>
+  <input type="file" id="fileInput" accept=".hex">
+
   <br><br>
   <button id="uploadBtn">Connect & Upload</button>
-<p id="instructions">
-  Plug in your Sync-it device via USB, select 'CP2102N USB to UART Bridge Controller' then click "Connect & Upload".<br>
-  Make sure no other apps (like Serial Monitor) are using the port.
-</p>
   <progress id="progress" value="0" max="100" style="display: block; width: 300px;"></progress>
   <div id="status"></div>
 
@@ -32,80 +31,105 @@
   <script>
     const selector = document.getElementById('firmwareSelector');
     const uploadBtn = document.getElementById('uploadBtn');
+    const fileInput = document.getElementById('fileInput');
     const status = document.getElementById('status');
     const progress = document.getElementById('progress');
 
     let selectedFirmware = null;
+    let userFile = null;
 
-    // Load manifest
-fetch('firmware/manifest.json')
-  .then(r => {
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    return r.json();
-  })
-  .then(files => {
-    selector.innerHTML = "";
-    files.forEach(file => {
-      const option = document.createElement('option');
-      option.value = `firmware/${file}`;
-      option.textContent = file;
-      selector.appendChild(option);
-    });
-    selectedFirmware = selector.value;
-  })
-  .catch(err => {
-    selector.innerHTML = "<option disabled>Error loading firmware list</option>";
-    status.textContent = "❌ Could not load manifest.json: " + err.message;
-  });
+    // Load manifest.json for GitHub firmware list
+    fetch('firmware/manifest.json')
+      .then(r => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.json();
+      })
+      .then(files => {
+        selector.innerHTML = "";
+        files.forEach(file => {
+          const option = document.createElement('option');
+          option.value = `firmware/${file}`;
+          option.textContent = file;
+          selector.appendChild(option);
+        });
+        selectedFirmware = selector.value;
+      })
+      .catch(err => {
+        selector.innerHTML = "<option disabled>Error loading firmware list</option>";
+        status.textContent = "❌ Could not load manifest.json: " + err.message;
+      });
 
     selector.onchange = () => {
       selectedFirmware = selector.value;
+      userFile = null;
+      fileInput.value = null;
+      status.textContent = `📁 Selected: ${selectedFirmware}`;
     };
 
-uploadBtn.onclick = async () => {
-  status.textContent = "";
-  progress.value = 0;
-if (!("serial" in navigator)) {
-  status.textContent = "❌ Web Serial API not supported. Please use a supported browser (Chrome/Edge) over HTTPS.";
-  return;
-}
-  let port = null;
-  let serial = null;
+    fileInput.addEventListener("change", (e) => {
+      const file = e.target.files[0];
+      if (file && file.name.endsWith(".hex")) {
+        userFile = file;
+        selectedFirmware = null;
+        selector.selectedIndex = -1;
+        status.textContent = `📂 Selected file: ${file.name}`;
+      } else {
+        userFile = null;
+        status.textContent = "❌ Please select a valid .hex file";
+      }
+    });
 
-  try {
-    // 1. Open serial port and reset
-    port = await navigator.serial.requestPort();
-    await port.open({ baudRate: 1200 });
-    await new Promise(r => setTimeout(r, 250));
-    await port.close();
+    uploadBtn.onclick = async () => {
+      status.textContent = "";
+      progress.value = 0;
 
-    // 2. Reconnect at bootloader baud rate
-    await port.open({ baudRate: 57600 });
-    serial = new AvrSerial(port);
-    await serial.open();
+      if (!("serial" in navigator)) {
+        status.textContent = "❌ Web Serial API not supported. Use Chrome or Edge over HTTPS.";
+        return;
+      }
 
-    const uploader = new STK500v1(serial);
+      let port = null;
+      let serial = null;
 
-    // 3. Fetch firmware hex
-    if (!selectedFirmware) throw new Error("No firmware selected");
-    const firmwareText = await fetch(selectedFirmware).then(r => r.text());
+      try {
+        // 1. Open serial port and reset
+        port = await navigator.serial.requestPort();
+        await port.open({ baudRate: 1200 });
+        await new Promise(r => setTimeout(r, 250));
+        await port.close();
 
-    // 4. Flash it
-    await uploader.flashHex(firmwareText, pct => progress.value = pct);
-    status.textContent = "✅ Upload complete!";
-  } catch (e) {
-    status.textContent = "❌ Upload failed: " + e.message;
-    console.error(e);
-  } finally {
-    // Always close serial port to prevent it getting stuck
-    try {
-      if (serial) await serial.close();
-      else if (port && port.readable && port.writable) await port.close();
-    } catch (err) {
-      console.warn("⚠️ Failed to fully close serial port:", err);
-    }
-  }
-};
+        // 2. Reconnect at bootloader baud rate
+        await port.open({ baudRate: 57600 });
+        serial = new AvrSerial(port);
+        await serial.open();
+
+        const uploader = new STK500v1(serial);
+
+        // 3. Get firmware contents
+        let firmwareText = "";
+        if (userFile) {
+          firmwareText = await userFile.text();
+        } else if (selectedFirmware) {
+          firmwareText = await fetch(selectedFirmware).then(r => r.text());
+        } else {
+          throw new Error("No firmware selected or uploaded");
+        }
+
+        // 4. Flash it
+        await uploader.flashHex(firmwareText, pct => progress.value = pct);
+        status.textContent = "✅ Upload complete!";
+      } catch (e) {
+        status.textContent = "❌ Upload failed: " + e.message;
+        console.error(e);
+      } finally {
+        try {
+          if (serial) await serial.close();
+          else if (port?.readable && port?.writable) await port.close();
+        } catch (err) {
+          console.warn("⚠️ Failed to fully close serial port:", err);
+        }
+      }
+    };
   </script>
 </body>
 </html>
