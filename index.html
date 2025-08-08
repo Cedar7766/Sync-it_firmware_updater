@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>UniqueID Reader</title>
+  <style>
+    body { font-family: sans-serif; padding: 2em; }
+    h1 { margin-bottom: 0.25em; }
+    #status { margin-top: 1em; color: darkred; }
+  </style>
+</head>
+<body>
+  <h1>Device UniqueID Reader</h1>
+  <button id="detectBtn">Detect UniqueID</button>
+  <div id="status">UniqueID: —</div>
+
+  <script>
+    const status = document.getElementById('status');
+
+    async function getDeviceSerialNumber(port, {timeoutMs = 8000, bauds = [115200, 57600, 38400]} = {}) {
+      const regex = /UniqueID:\s*([0-9A-Fa-f]+)/;
+      for (const baud of bauds) {
+        await port.open({ baudRate: baud });
+        const textDecoder = new TextDecoderStream();
+        const readableStreamClosed = port.readable.pipeTo(textDecoder.writable);
+        const reader = textDecoder.readable.getReader();
+
+        let buffer = '';
+        const start = performance.now();
+        let found = null;
+
+        try {
+          while (performance.now() - start < timeoutMs) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            if (value) {
+              buffer += value;
+              const lines = buffer.split(/\r?\n/);
+              buffer = lines.pop() ?? '';
+              for (const line of lines) {
+                const m = line.match(regex);
+                if (m) {
+                  found = m[1].toUpperCase();
+                  break;
+                }
+              }
+              if (found) break;
+            }
+          }
+        } finally {
+          try { reader.releaseLock(); } catch {}
+          try { await readableStreamClosed.catch(()=>{}); } catch {}
+          try { await port.close(); } catch {}
+        }
+
+        if (found) return found;
+      }
+      return null;
+    }
+
+    document.getElementById('detectBtn').onclick = async () => {
+      status.textContent = "Reading UniqueID...";
+      if (!("serial" in navigator)) {
+        status.textContent = "❌ Web Serial API not supported in this browser.";
+        return;
+      }
+      try {
+        const port = await navigator.serial.requestPort();
+        const uid = await getDeviceSerialNumber(port);
+        if (uid) {
+          status.textContent = "✅ UniqueID: " + uid;
+        } else {
+          status.textContent = "⚠️ No UniqueID detected within timeout.";
+        }
+      } catch (err) {
+        status.textContent = "❌ Error: " + err.message;
+      }
+    };
+  </script>
+</body>
+</html>
