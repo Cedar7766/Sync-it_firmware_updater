@@ -7,32 +7,33 @@
     body { font-family: sans-serif; padding: 2em; }
     h1 { margin-bottom: 0.5em; }
     #firmwareSelector { margin-right: 1em; }
-    #status { margin-top: 1em; color: darkred; }
+    #status { margin-top: 1em; white-space: pre-line; }
     #fileInput { margin-top: 0.5em; display: block; }
+    .muted { color: #666; }
   </style>
 </head>
 <body>
   <img src="Sync-it logo 4x3 transparent.png" alt="Sync-it Logo"
        style="max-width: 200px; display: block; margin-bottom: 1em;">
   <h1>Firmware Uploader</h1>
-  
+
   <label for="firmwareSelector">Choose firmware from list:</label>
   <select id="firmwareSelector">
     <option>Loading...</option>
   </select>
+
   <br><br>
-  
   <label for="fileInput">...or upload your own HEX file:</label>
   <input type="file" id="fileInput" accept=".hex">
-  
+
   <br><br>
-  <button id="uploadBtn">Connect & Read Serial → Upload</button>
-  <progress id="progress" value="0" max="100" style="display: block; width: 300px;"></progress>
-  <div id="status"></div>
-  
+  <button id="uploadBtn">Connect, Read Serial → Upload</button>
+  <progress id="progress" value="0" max="100" style="display:block;width:300px;"></progress>
+  <div id="status" class="muted"></div>
+
   <p id="instructions">
-    Remove the top plate, plug in your Sync-it device via a mini USB cable, then click "Connect & Upload".<br>
-    Make sure no other apps (like Serial Monitor) are using the port, select 'CP2102 USB to UART Bridge Controller'
+    Remove the top plate, plug in your Sync-it device via a mini USB cable, then click “Connect, Read Serial → Upload”.<br>
+    Make sure no other apps (like Serial Monitor) are using the port, select “CP2102 USB to UART Bridge Controller”.
   </p>
 
   <script src="avrbro.browser.js"></script>
@@ -48,10 +49,7 @@
 
     // Load manifest.json
     fetch('firmware/manifest.json')
-      .then(r => {
-        if (!r.ok) throw new Error(`HTTP ${r.status}`);
-        return r.json();
-      })
+      .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
       .then(files => {
         selector.innerHTML = "";
         files.forEach(file => {
@@ -87,20 +85,24 @@
       }
     });
 
-    async function getDeviceSerialNumber(port, timeoutMs = 8000) {
+    async function getDeviceSerialNumber(port, timeoutMs = 12000) {
+      // Read bytes and look for "UniqueID: XXXXX"
       const reader = port.readable.getReader();
       let textBuffer = "";
       const start = Date.now();
+      const dec = new TextDecoder();
+
       try {
         while (Date.now() - start < timeoutMs) {
           const { value, done } = await reader.read();
           if (done) break;
-          if (value) {
-            textBuffer += new TextDecoder().decode(value);
+          if (value && value.length) {
+            // Debug logging of raw bytes
+            console.log("RX:", Array.from(value).map(b => b.toString(16).padStart(2,'0')).join(' '));
+            textBuffer += dec.decode(value, { stream: true });
+
             const match = textBuffer.match(/UniqueID:\s*([0-9A-F]+)/i);
-            if (match) {
-              return match[1];
-            }
+            if (match) return match[1];
           }
         }
         return null;
@@ -122,33 +124,49 @@
       let serial = null;
 
       try {
-        // 1️⃣ Step 1: Connect in app mode to read UniqueID
+        // Ask user to pick the port once
         port = await navigator.serial.requestPort();
-        await port.open({ baudRate: 57600 });
-        status.textContent = "⏳ Waiting for device UniqueID...";
-        const deviceId = await getDeviceSerialNumber(port);
-        await port.close();
 
-        if (!deviceId) {
-          throw new Error("Timed out waiting for UniqueID");
-        }
-        status.textContent = `✅ Detected device UniqueID: ${deviceId}`;
-
-        // (Optional) Match against firmware name here:
-        // if (!selectedFirmware.includes(deviceId)) throw new Error("Firmware does not match device ID!");
-
-        // 2️⃣ Step 2: Reset to bootloader
+        // --- Reset first so the device boots fresh and will print the UniqueID after ~7s ---
+        status.textContent = "🔄 Resetting device to read UniqueID…";
         await port.open({ baudRate: 1200 });
         await new Promise(r => setTimeout(r, 250));
         await port.close();
 
-        // 3️⃣ Step 3: Reconnect in bootloader mode
+        // Open at app baud to watch for the UniqueID
+        await port.open({ baudRate: 57600 });
+        status.textContent = "⏳ Waiting for device UniqueID (up to ~12s)…";
+        const deviceId = await getDeviceSerialNumber(port, 12000);
+        await port.close();
+
+        if (deviceId) {
+          status.textContent = `✅ Detected device UniqueID: ${deviceId}`;
+        } else {
+          const proceed = confirm("⚠️ No UniqueID received.\nProceed with upload anyway?");
+          if (!proceed) {
+            return;
+          }
+          status.textContent = "Proceeding without UniqueID…";
+        }
+
+        // (Optional) Auto-match firmware by ID here, if you adopt a naming convention:
+        // if (deviceId && selectedFirmware && !selectedFirmware.includes(deviceId)) {
+        //   throw new Error(`Selected firmware does not match device ID ${deviceId}.`);
+        // }
+
+        // --- Now reset again to enter the bootloader for flashing ---
+        status.textContent += "\n🔄 Resetting into bootloader…";
+        await port.open({ baudRate: 1200 });
+        await new Promise(r => setTimeout(r, 250));
+        await port.close();
+
+        // Re-open at bootloader baud
         await port.open({ baudRate: 57600 });
         serial = new AvrSerial(port);
         await serial.open();
         const uploader = new STK500v1(serial);
 
-        // 4️⃣ Step 4: Get firmware
+        // Get firmware text
         let firmwareText = "";
         if (userFile) {
           firmwareText = await userFile.text();
@@ -158,11 +176,12 @@
           throw new Error("No firmware selected or uploaded");
         }
 
-        // 5️⃣ Step 5: Flash firmware
-        await uploader.flashHex(firmwareText, pct => progress.value = pct);
+        // Flash
+        status.textContent += "\n⬆️ Uploading…";
+        await uploader.flashHex(firmwareText, pct => (progress.value = pct));
         status.textContent += "\n✅ Upload complete!";
       } catch (e) {
-        status.textContent = "❌ Upload failed: " + e.message;
+        status.textContent += "\n❌ Upload failed: " + e.message;
         console.error(e);
       } finally {
         try {
