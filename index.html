@@ -1,166 +1,176 @@
 <!DOCTYPE html>
 <html>
 <head>
-  <meta charset="utf-8" />
-  <title>Read Device UniqueID</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta charset="utf-8">
+  <title>Sync-it Firmware Uploader</title>
   <style>
-    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; padding: 2rem; line-height: 1.4; }
-    h1 { margin: 0 0 0.75rem; }
-    .row { display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap; }
-    button { padding: 0.6rem 1rem; font-size: 1rem; cursor: pointer; }
-    #status { margin-top: 1rem; min-height: 1.5em; }
-    .ok { color: #047857; }
-    .err { color: #b91c1c; }
-    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-    .muted { color: #555; }
+    body { font-family: sans-serif; padding: 2em; }
+    h1 { margin-bottom: 0.5em; }
+    #firmwareSelector { margin-right: 1em; }
+    #status { margin-top: 1em; color: darkred; }
+    #fileInput { margin-top: 0.5em; display: block; }
   </style>
 </head>
 <body>
-  <h1>Read Device UniqueID</h1>
-  <p class="muted">
-    Connect your device, then click <b>Connect & Read ID</b>. Your device reboots and prints
-    <span class="mono">UniqueID: &lt;hex&gt;</span> about 7 seconds later. We capture that line immediately and stop reading.
+  <img src="Sync-it logo 4x3 transparent.png" alt="Sync-it Logo"
+       style="max-width: 200px; display: block; margin-bottom: 1em;">
+  <h1>Firmware Uploader</h1>
+  
+  <label for="firmwareSelector">Choose firmware from list:</label>
+  <select id="firmwareSelector">
+    <option>Loading...</option>
+  </select>
+  <br><br>
+  
+  <label for="fileInput">...or upload your own HEX file:</label>
+  <input type="file" id="fileInput" accept=".hex">
+  
+  <br><br>
+  <button id="uploadBtn">Connect & Read Serial → Upload</button>
+  <progress id="progress" value="0" max="100" style="display: block; width: 300px;"></progress>
+  <div id="status"></div>
+  
+  <p id="instructions">
+    Remove the top plate, plug in your Sync-it device via a mini USB cable, then click "Connect & Upload".<br>
+    Make sure no other apps (like Serial Monitor) are using the port, select 'CP2102 USB to UART Bridge Controller'
   </p>
 
-  <div class="row">
-    <button id="btnConnect">Connect & Read ID</button>
-    <button id="btnClose" disabled>Close Port</button>
-  </div>
-
-  <div id="status"></div>
-
+  <script src="avrbro.browser.js"></script>
   <script>
-    // --- Utilities ------------------------------------------------------------
+    const selector = document.getElementById('firmwareSelector');
+    const uploadBtn = document.getElementById('uploadBtn');
+    const fileInput = document.getElementById('fileInput');
+    const status = document.getElementById('status');
+    const progress = document.getElementById('progress');
 
-    function setStatus(msg, isError = false) {
-      const s = document.getElementById('status');
-      s.className = isError ? 'err' : 'ok';
-      s.textContent = msg;
-    }
+    let selectedFirmware = null;
+    let userFile = null;
 
-    // Reads text lines until it finds one that starts with "UniqueID:"
-    // Cancels the reader immediately after, so it doesn't wait for disconnect.
-    async function readUniqueId(port, {
-      baud = 115200,
-      bootWaitMs = 7500,     // time for your app to boot and print UniqueID
-      overallTimeout = 15000 // safety timeout
-    } = {}) {
-      // Ensure port is open at baud
-      if (!port.readable) {
-        await port.open({ baudRate: baud });
+    // Load manifest.json
+    fetch('firmware/manifest.json')
+      .then(r => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.json();
+      })
+      .then(files => {
+        selector.innerHTML = "";
+        files.forEach(file => {
+          const option = document.createElement('option');
+          option.value = `firmware/${file}`;
+          option.textContent = file;
+          selector.appendChild(option);
+        });
+        selectedFirmware = selector.value;
+      })
+      .catch(err => {
+        selector.innerHTML = "<option disabled>Error loading firmware list</option>";
+        status.textContent = "❌ Could not load manifest.json: " + err.message;
+      });
+
+    selector.onchange = () => {
+      selectedFirmware = selector.value;
+      userFile = null;
+      fileInput.value = null;
+      status.textContent = `📁 Selected: ${selectedFirmware}`;
+    };
+
+    fileInput.addEventListener("change", (e) => {
+      const file = e.target.files[0];
+      if (file && file.name.endsWith(".hex")) {
+        userFile = file;
+        selectedFirmware = null;
+        selector.selectedIndex = -1;
+        status.textContent = `📂 Selected file: ${file.name}`;
+      } else {
+        userFile = null;
+        status.textContent = "❌ Please select a valid .hex file";
       }
+    });
 
-      // Wait so we start listening before the device prints the ID
-      await new Promise(r => setTimeout(r, bootWaitMs));
-
-      const textDecoder = new TextDecoderStream();
-      const closed = port.readable.pipeTo(textDecoder.writable);
-      const reader = textDecoder.readable.getReader();
-
-      let buf = "";
-      let found = null;
-      let timedOut = false;
-
-      const timer = setTimeout(() => {
-        timedOut = true;
-        try { reader.cancel("timeout"); } catch {}
-      }, overallTimeout);
-
+    async function getDeviceSerialNumber(port, timeoutMs = 8000) {
+      const reader = port.readable.getReader();
+      let textBuffer = "";
+      const start = Date.now();
       try {
-        while (true) {
+        while (Date.now() - start < timeoutMs) {
           const { value, done } = await reader.read();
           if (done) break;
           if (value) {
-            buf += value;
-            let idx;
-            while ((idx = buf.indexOf("\n")) >= 0) {
-              const line = buf.slice(0, idx).trim();
-              buf = buf.slice(idx + 1);
-              // console.log("LINE:", line); // uncomment to debug
-              if (line.startsWith("UniqueID:")) {
-                found = line; // e.g. "UniqueID: 563052494F4D69090735"
-                try { await reader.cancel(); } catch {}
-                break;
-              }
+            textBuffer += new TextDecoder().decode(value);
+            const match = textBuffer.match(/UniqueID:\s*([0-9A-F]+)/i);
+            if (match) {
+              return match[1];
             }
           }
-          if (found) break;
         }
+        return null;
       } finally {
-        clearTimeout(timer);
-        try { await closed.catch(() => {}); } catch {}
-        try { reader.releaseLock(); } catch {}
+        reader.releaseLock();
       }
-
-      if (!found) {
-        if (timedOut) throw new Error("Timed out waiting for UniqueID");
-        throw new Error("Stream ended before UniqueID appeared");
-      }
-      return found;
     }
 
-    // --- Page logic -----------------------------------------------------------
+    uploadBtn.onclick = async () => {
+      status.textContent = "";
+      progress.value = 0;
 
-    const btnConnect = document.getElementById('btnConnect');
-    const btnClose = document.getElementById('btnClose');
-
-    let port = null;
-
-    // Optional: toggle DTR 1200 baud to force bootloader/app reset
-    async function pulse1200Reset(p) {
-      await p.open({ baudRate: 1200 });
-      await new Promise(r => setTimeout(r, 250));
-      await p.close();
-    }
-
-    btnConnect.onclick = async () => {
-      setStatus("");
       if (!("serial" in navigator)) {
-        setStatus("❌ Web Serial API not supported. Use Chrome/Edge over HTTPS (or http://localhost).", true);
+        status.textContent = "❌ Web Serial API not supported. Use Chrome/Edge over HTTPS.";
         return;
       }
 
+      let port = null;
+      let serial = null;
+
       try {
-        // Choose port
+        // 1️⃣ Step 1: Connect in app mode to read UniqueID
         port = await navigator.serial.requestPort();
-        btnClose.disabled = false;
+        await port.open({ baudRate: 57600 });
+        status.textContent = "⏳ Waiting for device UniqueID...";
+        const deviceId = await getDeviceSerialNumber(port);
+        await port.close();
 
-        // If your device resets on open automatically, you can skip the 1200 pulse.
-        // If you need to force a reset, uncomment the next line:
-        // await pulse1200Reset(port);
-
-        // Open at the app's baud rate, read UniqueID after boot wait:
-        await port.open({ baudRate: 115200 });
-
-        setStatus("⏳ Waiting for device to print UniqueID...");
-        const line = await readUniqueId(port, { baud: 115200, bootWaitMs: 7500, overallTimeout: 20000 });
-
-        const hex = (line.split("UniqueID:")[1] || "").trim();
-        setStatus(`✅ UniqueID: ${hex}`);
-
-        // Keep the port open for further actions if you want, or close it:
-        // await port.close();
-      } catch (err) {
-        setStatus(`❌ ${err.message}`, true);
-        console.error(err);
-        try { if (port && port.readable && port.writable) await port.close(); } catch {}
-        btnClose.disabled = true;
-        port = null;
-      }
-    };
-
-    btnClose.onclick = async () => {
-      try {
-        if (port && port.readable && port.writable) {
-          await port.close();
-          setStatus("🔌 Port closed.");
+        if (!deviceId) {
+          throw new Error("Timed out waiting for UniqueID");
         }
+        status.textContent = `✅ Detected device UniqueID: ${deviceId}`;
+
+        // (Optional) Match against firmware name here:
+        // if (!selectedFirmware.includes(deviceId)) throw new Error("Firmware does not match device ID!");
+
+        // 2️⃣ Step 2: Reset to bootloader
+        await port.open({ baudRate: 1200 });
+        await new Promise(r => setTimeout(r, 250));
+        await port.close();
+
+        // 3️⃣ Step 3: Reconnect in bootloader mode
+        await port.open({ baudRate: 57600 });
+        serial = new AvrSerial(port);
+        await serial.open();
+        const uploader = new STK500v1(serial);
+
+        // 4️⃣ Step 4: Get firmware
+        let firmwareText = "";
+        if (userFile) {
+          firmwareText = await userFile.text();
+        } else if (selectedFirmware) {
+          firmwareText = await fetch(selectedFirmware).then(r => r.text());
+        } else {
+          throw new Error("No firmware selected or uploaded");
+        }
+
+        // 5️⃣ Step 5: Flash firmware
+        await uploader.flashHex(firmwareText, pct => progress.value = pct);
+        status.textContent += "\n✅ Upload complete!";
       } catch (e) {
-        console.warn("Failed to close port:", e);
+        status.textContent = "❌ Upload failed: " + e.message;
+        console.error(e);
       } finally {
-        btnClose.disabled = true;
-        port = null;
+        try {
+          if (serial) await serial.close();
+          else if (port?.readable && port?.writable) await port.close();
+        } catch (err) {
+          console.warn("⚠️ Failed to fully close serial port:", err);
+        }
       }
     };
   </script>
