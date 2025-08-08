@@ -1,79 +1,166 @@
 <!DOCTYPE html>
 <html>
 <head>
-  <meta charset="utf-8">
-  <title>UniqueID Reader</title>
+  <meta charset="utf-8" />
+  <title>Read Device UniqueID</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
-    body { font-family: sans-serif; padding: 2em; }
-    h1 { margin-bottom: 0.25em; }
-    #status { margin-top: 1em; color: darkred; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; padding: 2rem; line-height: 1.4; }
+    h1 { margin: 0 0 0.75rem; }
+    .row { display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap; }
+    button { padding: 0.6rem 1rem; font-size: 1rem; cursor: pointer; }
+    #status { margin-top: 1rem; min-height: 1.5em; }
+    .ok { color: #047857; }
+    .err { color: #b91c1c; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .muted { color: #555; }
   </style>
 </head>
 <body>
-  <h1>Device UniqueID Reader</h1>
-  <button id="detectBtn">Detect UniqueID</button>
-  <div id="status">UniqueID: —</div>
+  <h1>Read Device UniqueID</h1>
+  <p class="muted">
+    Connect your device, then click <b>Connect & Read ID</b>. Your device reboots and prints
+    <span class="mono">UniqueID: &lt;hex&gt;</span> about 7 seconds later. We capture that line immediately and stop reading.
+  </p>
+
+  <div class="row">
+    <button id="btnConnect">Connect & Read ID</button>
+    <button id="btnClose" disabled>Close Port</button>
+  </div>
+
+  <div id="status"></div>
 
   <script>
-    const status = document.getElementById('status');
+    // --- Utilities ------------------------------------------------------------
 
-    async function getDeviceSerialNumber(port, {timeoutMs = 8000, bauds = [115200, 57600, 38400]} = {}) {
-      const regex = /UniqueID:\s*([0-9A-Fa-f]+)/;
-      for (const baud of bauds) {
-        await port.open({ baudRate: baud });
-        const textDecoder = new TextDecoderStream();
-        const readableStreamClosed = port.readable.pipeTo(textDecoder.writable);
-        const reader = textDecoder.readable.getReader();
-
-        let buffer = '';
-        const start = performance.now();
-        let found = null;
-
-        try {
-          while (performance.now() - start < timeoutMs) {
-            const { value, done } = await reader.read();
-            if (done) break;
-            if (value) {
-              buffer += value;
-              const lines = buffer.split(/\r?\n/);
-              buffer = lines.pop() ?? '';
-              for (const line of lines) {
-                const m = line.match(regex);
-                if (m) {
-                  found = m[1].toUpperCase();
-                  break;
-                }
-              }
-              if (found) break;
-            }
-          }
-        } finally {
-          try { reader.releaseLock(); } catch {}
-          try { await readableStreamClosed.catch(()=>{}); } catch {}
-          try { await port.close(); } catch {}
-        }
-
-        if (found) return found;
-      }
-      return null;
+    function setStatus(msg, isError = false) {
+      const s = document.getElementById('status');
+      s.className = isError ? 'err' : 'ok';
+      s.textContent = msg;
     }
 
-    document.getElementById('detectBtn').onclick = async () => {
-      status.textContent = "Reading UniqueID...";
+    // Reads text lines until it finds one that starts with "UniqueID:"
+    // Cancels the reader immediately after, so it doesn't wait for disconnect.
+    async function readUniqueId(port, {
+      baud = 115200,
+      bootWaitMs = 7500,     // time for your app to boot and print UniqueID
+      overallTimeout = 15000 // safety timeout
+    } = {}) {
+      // Ensure port is open at baud
+      if (!port.readable) {
+        await port.open({ baudRate: baud });
+      }
+
+      // Wait so we start listening before the device prints the ID
+      await new Promise(r => setTimeout(r, bootWaitMs));
+
+      const textDecoder = new TextDecoderStream();
+      const closed = port.readable.pipeTo(textDecoder.writable);
+      const reader = textDecoder.readable.getReader();
+
+      let buf = "";
+      let found = null;
+      let timedOut = false;
+
+      const timer = setTimeout(() => {
+        timedOut = true;
+        try { reader.cancel("timeout"); } catch {}
+      }, overallTimeout);
+
+      try {
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          if (value) {
+            buf += value;
+            let idx;
+            while ((idx = buf.indexOf("\n")) >= 0) {
+              const line = buf.slice(0, idx).trim();
+              buf = buf.slice(idx + 1);
+              // console.log("LINE:", line); // uncomment to debug
+              if (line.startsWith("UniqueID:")) {
+                found = line; // e.g. "UniqueID: 563052494F4D69090735"
+                try { await reader.cancel(); } catch {}
+                break;
+              }
+            }
+          }
+          if (found) break;
+        }
+      } finally {
+        clearTimeout(timer);
+        try { await closed.catch(() => {}); } catch {}
+        try { reader.releaseLock(); } catch {}
+      }
+
+      if (!found) {
+        if (timedOut) throw new Error("Timed out waiting for UniqueID");
+        throw new Error("Stream ended before UniqueID appeared");
+      }
+      return found;
+    }
+
+    // --- Page logic -----------------------------------------------------------
+
+    const btnConnect = document.getElementById('btnConnect');
+    const btnClose = document.getElementById('btnClose');
+
+    let port = null;
+
+    // Optional: toggle DTR 1200 baud to force bootloader/app reset
+    async function pulse1200Reset(p) {
+      await p.open({ baudRate: 1200 });
+      await new Promise(r => setTimeout(r, 250));
+      await p.close();
+    }
+
+    btnConnect.onclick = async () => {
+      setStatus("");
       if (!("serial" in navigator)) {
-        status.textContent = "❌ Web Serial API not supported in this browser.";
+        setStatus("❌ Web Serial API not supported. Use Chrome/Edge over HTTPS (or http://localhost).", true);
         return;
       }
+
       try {
-        const port = await navigator.serial.requestPort();
-        const uid = await getDeviceSerialNumber(port);
-        if (uid) {
-          status.textContent = "✅ UniqueID: " + uid;
-        } else {
-          status.textContent = "⚠️ No UniqueID detected within timeout.";
-        }
+        // Choose port
+        port = await navigator.serial.requestPort();
+        btnClose.disabled = false;
+
+        // If your device resets on open automatically, you can skip the 1200 pulse.
+        // If you need to force a reset, uncomment the next line:
+        // await pulse1200Reset(port);
+
+        // Open at the app's baud rate, read UniqueID after boot wait:
+        await port.open({ baudRate: 115200 });
+
+        setStatus("⏳ Waiting for device to print UniqueID...");
+        const line = await readUniqueId(port, { baud: 115200, bootWaitMs: 7500, overallTimeout: 20000 });
+
+        const hex = (line.split("UniqueID:")[1] || "").trim();
+        setStatus(`✅ UniqueID: ${hex}`);
+
+        // Keep the port open for further actions if you want, or close it:
+        // await port.close();
       } catch (err) {
-        status.textContent = "❌ Error: " + err.message;
+        setStatus(`❌ ${err.message}`, true);
+        console.error(err);
+        try { if (port && port.readable && port.writable) await port.close(); } catch {}
+        btnClose.disabled = true;
+        port = null;
+      }
+    };
+
+    btnClose.onclick = async () => {
+      try {
+        if (port && port.readable && port.writable) {
+          await port.close();
+          setStatus("🔌 Port closed.");
+        }
+      } catch (e) {
+        console.warn("Failed to close port:", e);
+      } finally {
+        btnClose.disabled = true;
+        port = null;
       }
     };
   </script>
