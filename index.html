@@ -144,15 +144,29 @@
         const uploader = new STK500v1(serial);
 
         // 4. Flash it
-        await uploader.flashHex(
+        const result = await uploader.flashHex(
           firmwareText,
           pct => progress.value = pct,
           {
             bootloaderStart: defaultBootloaderStart,
             allowBootloaderOverwrite,
+            verifyBootloaderOverwrite: allowBootloaderOverwrite,
           }
         );
-        status.textContent = "✅ Upload complete!";
+
+        if (result.verification?.actualOverwrite) {
+          status.textContent =
+            `⚠️ Upload complete. Bootloader overwrite verified (${result.verification.checkedBytes} bytes matched in bootloader region).`;
+        } else if (result.verification?.protected) {
+          const mismatch = result.verification.firstMismatch;
+          const mismatchDetail = mismatch
+            ? ` First mismatch at 0x${mismatch.address.toString(16)} (expected 0x${mismatch.expected.toString(16).padStart(2, "0")}, read back 0x${mismatch.actual.toString(16).padStart(2, "0")}).`
+            : "";
+          status.textContent =
+            `✅ Upload complete. Bootloader overwrite was attempted but not verified; the bootloader region appears to remain protected.${mismatchDetail}`;
+        } else {
+          status.textContent = "✅ Upload complete!";
+        }
       } catch (e) {
         status.textContent = "❌ Upload failed: " + e.message;
         console.error(e);

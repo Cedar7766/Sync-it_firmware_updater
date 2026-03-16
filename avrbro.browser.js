@@ -43,6 +43,14 @@ class AvrSerial {
     return await Promise.race([pull(), timeoutP]);
   }
 
+  async readBytes(count, timeout = 1000) {
+    const bytes = [];
+    for (let i = 0; i < count; i++) {
+      bytes.push(await this.readByte(timeout));
+    }
+    return bytes;
+  }
+
 async readBytePair(timeout = 500) {
   if (this._readingPair) {
     throw new Error("readBytePair() already in progress");
@@ -94,6 +102,7 @@ function analyzeHex(hexText, options = {}) {
   const pageSize = options.pageSize ?? 128;
   const bootloaderStart = options.bootloaderStart ?? 0x7800;
   const pages = [];
+  const dataMap = new Map();
   const lines = hexText.split(/\r?\n/);
   let curr = 0;
   let buff = [];
@@ -123,7 +132,9 @@ function analyzeHex(hexText, options = {}) {
 
     const data = [];
     for (let j = 0; j < len; j++) {
-      data.push(parseInt(line.substr(9 + j * 2, 2), 16));
+      const value = parseInt(line.substr(9 + j * 2, 2), 16);
+      data.push(value);
+      dataMap.set(addr + j, value);
     }
 
     if (addr !== curr + buff.length) {
@@ -149,6 +160,7 @@ function analyzeHex(hexText, options = {}) {
     pageSize,
     bootloaderStart,
     dataBytes,
+    dataMap,
     highestAddress,
     firstBootloaderAddress,
     bootloaderOverwrite: firstBootloaderAddress !== null,
@@ -210,11 +222,79 @@ async programPage(data) {
 
   if (r !== 0x14 || ok !== 0x10) throw new Error("programPage failed");
 }
+  async readPage(size) {
+    const high = (size >> 8) & 0xFF;
+    const low = size & 0xFF;
+
+    await this.serial.writeBytes([0x74, high, low, 0x46, 0x20]);
+
+    const start = await this.serial.readByte(1000);
+    if (start !== 0x14) throw new Error("readPage failed to start");
+
+    const data = await this.serial.readBytes(size, 1000);
+    const ok = await this.serial.readByte(1000);
+    if (ok !== 0x10) throw new Error("readPage failed to finish");
+
+    return data;
+  }
   async leaveProgrammingMode() {
     await this.serial.writeBytes([0x51,0x20]);
     const [r,ok] = await this.serial.readBytePair(500);
     if (r!==0x14||ok!==0x10) throw new Error("leaveProgMode failed");
   }
+async verifyBootloaderRegion(analysis) {
+  const bootloaderPages = analysis.pages.filter(([addr, data]) => addr + data.length > analysis.bootloaderStart);
+
+  if (!bootloaderPages.length) {
+    return null;
+  }
+
+  let checkedBytes = 0;
+  let matchedBytes = 0;
+  let mismatchedBytes = 0;
+  let firstMismatch = null;
+
+  for (const [addr, data] of bootloaderPages) {
+    await this.loadAddress(addr >> 1);
+    const readBack = await this.readPage(data.length);
+
+    for (let i = 0; i < data.length; i++) {
+      const absoluteAddr = addr + i;
+      if (absoluteAddr < analysis.bootloaderStart) {
+        continue;
+      }
+
+      const expected = analysis.dataMap.get(absoluteAddr);
+      if (expected === undefined) {
+        continue;
+      }
+
+      checkedBytes += 1;
+      if (readBack[i] === expected) {
+        matchedBytes += 1;
+      } else {
+        mismatchedBytes += 1;
+        if (!firstMismatch) {
+          firstMismatch = {
+            address: absoluteAddr,
+            expected,
+            actual: readBack[i],
+          };
+        }
+      }
+    }
+  }
+
+  return {
+    attempted: true,
+    checkedBytes,
+    matchedBytes,
+    mismatchedBytes,
+    actualOverwrite: checkedBytes > 0 && mismatchedBytes === 0,
+    protected: checkedBytes > 0 && mismatchedBytes > 0,
+    firstMismatch,
+  };
+}
 async flashHex(hexText, onProgress, options = {}) {
   await this.sync();
   await this.enterProgrammingMode();
@@ -236,7 +316,16 @@ async flashHex(hexText, onProgress, options = {}) {
     onProgress?.(Math.round((i + 1) / analysis.pages.length * 100));
   }
 
+  const verification = options.verifyBootloaderOverwrite && analysis.bootloaderOverwrite
+    ? await this.verifyBootloaderRegion(analysis)
+    : null;
+
   await this.leaveProgrammingMode();
+
+  return {
+    analysis,
+    verification,
+  };
 }
 }
 
