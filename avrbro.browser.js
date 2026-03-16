@@ -90,6 +90,71 @@ async readBytePair(timeout = 500) {
 }
 }
 
+function analyzeHex(hexText, options = {}) {
+  const pageSize = options.pageSize ?? 128;
+  const bootloaderStart = options.bootloaderStart ?? 0x7800;
+  const pages = [];
+  const lines = hexText.split(/\r?\n/);
+  let curr = 0;
+  let buff = [];
+  let dataBytes = 0;
+  let highestAddress = 0;
+  let firstBootloaderAddress = null;
+
+  for (const line of lines) {
+    if (!line.startsWith(":")) continue;
+
+    const len = parseInt(line.substr(1, 2), 16);
+    const addr = parseInt(line.substr(3, 4), 16);
+    const type = parseInt(line.substr(7, 2), 16);
+
+    if (type === 1) break;
+    if (type !== 0) continue;
+
+    const dataEnd = addr + len;
+    if (dataEnd > highestAddress) {
+      highestAddress = dataEnd;
+    }
+    dataBytes += len;
+
+    if (dataEnd > bootloaderStart && firstBootloaderAddress === null) {
+      firstBootloaderAddress = Math.max(addr, bootloaderStart);
+    }
+
+    const data = [];
+    for (let j = 0; j < len; j++) {
+      data.push(parseInt(line.substr(9 + j * 2, 2), 16));
+    }
+
+    if (addr !== curr + buff.length) {
+      while (buff.length) {
+        const chunk = buff.splice(0, pageSize);
+        pages.push([curr, chunk]);
+        curr += pageSize;
+      }
+      curr = addr;
+    }
+
+    buff.push(...data);
+  }
+
+  while (buff.length) {
+    const chunk = buff.splice(0, pageSize);
+    pages.push([curr, chunk]);
+    curr += pageSize;
+  }
+
+  return {
+    pages,
+    pageSize,
+    bootloaderStart,
+    dataBytes,
+    highestAddress,
+    firstBootloaderAddress,
+    bootloaderOverwrite: firstBootloaderAddress !== null,
+  };
+}
+
 class STK500v1 {
   constructor(serial) {
     this.serial = serial;
@@ -150,59 +215,25 @@ async programPage(data) {
     const [r,ok] = await this.serial.readBytePair(500);
     if (r!==0x14||ok!==0x10) throw new Error("leaveProgMode failed");
   }
-async flashHex(hexText, onProgress) {
+async flashHex(hexText, onProgress, options = {}) {
   await this.sync();
   await this.enterProgrammingMode();
 
-  const pages = [];
-  const lines = hexText.split(/\r?\n/);
-  let curr = 0;
-  let buff = [];
-  const pageSize = 128;
-  const bootloaderStart = 0x7800; // ⛔ Modify if your bootloader starts elsewhere
+  const analysis = analyzeHex(hexText, options);
 
-  for (const l of lines) {
-    if (!l.startsWith(":")) continue;
-    const len = parseInt(l.substr(1, 2), 16);
-    const addr = parseInt(l.substr(3, 4), 16);
-    const type = parseInt(l.substr(7, 2), 16);
-    if (type === 1) break; // EOF
-    if (type !== 0) continue; // Not data
-
-    //  Bootloader protection
-    if (addr >= bootloaderStart) {
-      throw new Error(`HEX file tries to write to 0x${addr.toString(16)} (bootloader region).`);
-    }
-
-    const data = [];
-    for (let j = 0; j < len; j++) {
-      data.push(parseInt(l.substr(9 + j * 2, 2), 16));
-    }
-
-    if (addr !== curr + buff.length) {
-      while (buff.length) {
-        const chunk = buff.splice(0, pageSize);
-        pages.push([curr, chunk]);
-        curr += pageSize;
-      }
-      curr = addr;
-    }
-
-    buff.push(...data);
+  if (analysis.bootloaderOverwrite && !options.allowBootloaderOverwrite) {
+    throw new Error(
+      `HEX file tries to write to 0x${analysis.firstBootloaderAddress.toString(16)} ` +
+      `(bootloader region starts at 0x${analysis.bootloaderStart.toString(16)}).`
+    );
   }
 
-  while (buff.length) {
-    const chunk = buff.splice(0, pageSize);
-    pages.push([curr, chunk]);
-    curr += pageSize;
-  }
-
-  for (let i = 0; i < pages.length; i++) {
-    const [addr, data] = pages[i];
-    console.log(`Flashing page ${i + 1}/${pages.length}, addr=0x${addr.toString(16)}`);
+  for (let i = 0; i < analysis.pages.length; i++) {
+    const [addr, data] = analysis.pages[i];
+    console.log(`Flashing page ${i + 1}/${analysis.pages.length}, addr=0x${addr.toString(16)}`);
     await this.loadAddress(addr >> 1);
     await this.programPage(data);
-    onProgress?.(Math.round((i + 1) / pages.length * 100));
+    onProgress?.(Math.round((i + 1) / analysis.pages.length * 100));
   }
 
   await this.leaveProgrammingMode();
@@ -211,3 +242,4 @@ async flashHex(hexText, onProgress) {
 
 window.AvrSerial = AvrSerial;
 window.STK500v1   = STK500v1;
+window.analyzeHex = analyzeHex;

@@ -40,6 +40,7 @@
     const fileInput = document.getElementById('fileInput');
     const status = document.getElementById('status');
     const progress = document.getElementById('progress');
+    const defaultBootloaderStart = 0x7800;
 
     let selectedFirmware = null;
     let userFile = null;
@@ -89,29 +90,16 @@
       status.textContent = "";
       progress.value = 0;
 
-      if (!("serial" in navigator)) {
-        status.textContent = "❌ Web Serial API not supported. Use Chrome or Edge over HTTPS.";
-        return;
-      }
-
       let port = null;
       let serial = null;
 
       try {
-        // 1. Open serial port and reset
-        port = await navigator.serial.requestPort();
-        await port.open({ baudRate: 1200 });
-        await new Promise(r => setTimeout(r, 250));
-        await port.close();
+        if (!("serial" in navigator)) {
+          status.textContent = "❌ Web Serial API not supported. Use Chrome or Edge over HTTPS.";
+          return;
+        }
 
-        // 2. Reconnect at bootloader baud rate
-        await port.open({ baudRate: 57600 });
-        serial = new AvrSerial(port);
-        await serial.open();
-
-        const uploader = new STK500v1(serial);
-
-        // 3. Get firmware contents
+        // 1. Get firmware contents
         let firmwareText = "";
         if (userFile) {
           firmwareText = await userFile.text();
@@ -121,8 +109,49 @@
           throw new Error("No firmware selected or uploaded");
         }
 
+        const analysis = analyzeHex(firmwareText, { bootloaderStart: defaultBootloaderStart });
+        let allowBootloaderOverwrite = false;
+
+        if (analysis.bootloaderOverwrite) {
+          const warning = [
+            "This HEX file would overwrite the installed bootloader.",
+            `Bootloader region starts at 0x${analysis.bootloaderStart.toString(16)}.`,
+            `The HEX file reaches 0x${analysis.highestAddress.toString(16)} and first overlaps at 0x${analysis.firstBootloaderAddress.toString(16)}.`,
+            "If you continue, future WebSerial updates may stop working until the bootloader is restored.",
+            "",
+            "Press OK to continue anyway, or Cancel to stop.",
+          ].join("\n");
+
+          if (!window.confirm(warning)) {
+            status.textContent = "⚠️ Upload cancelled. Selected firmware would overwrite the bootloader.";
+            return;
+          }
+
+          allowBootloaderOverwrite = true;
+        }
+
+        // 2. Open serial port and reset
+        port = await navigator.serial.requestPort();
+        await port.open({ baudRate: 1200 });
+        await new Promise(r => setTimeout(r, 250));
+        await port.close();
+
+        // 3. Reconnect at bootloader baud rate
+        await port.open({ baudRate: 57600 });
+        serial = new AvrSerial(port);
+        await serial.open();
+
+        const uploader = new STK500v1(serial);
+
         // 4. Flash it
-        await uploader.flashHex(firmwareText, pct => progress.value = pct);
+        await uploader.flashHex(
+          firmwareText,
+          pct => progress.value = pct,
+          {
+            bootloaderStart: defaultBootloaderStart,
+            allowBootloaderOverwrite,
+          }
+        );
         status.textContent = "✅ Upload complete!";
       } catch (e) {
         status.textContent = "❌ Upload failed: " + e.message;
