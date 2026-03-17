@@ -105,6 +105,7 @@
     const APP_COMMAND_ATTEMPTS = 2;
     const APP_COMMAND_RETRY_DELAY_MS = 250;
     const APP_RESPONSE_TIMEOUT_MS = 2500;
+    const APP_POST_COMMAND_DELAY_MS = 75;
     const defaultBootloaderStart = 0x7800;
     const textEncoder = new TextEncoder();
     const PRINTABLE_ASCII_REGEX = /^[\x20-\x7E]*$/;
@@ -269,21 +270,34 @@
     }
 
     async function sendCommandExpectOk(writer, reader, command, stepLabel) {
-      await writer.write(textEncoder.encode(`${command}\n`));
+      let response = await readSerialText(reader, 150);
 
-      const response = await readSerialText(
-        reader,
-        APP_RESPONSE_TIMEOUT_MS,
-        text => parseCommandStatus(text) !== null
-      );
+      for (let attempt = 0; attempt < APP_COMMAND_ATTEMPTS; attempt++) {
+        await writer.write(textEncoder.encode(`${command}\n`));
 
-      const status = parseCommandStatus(response);
-      if (status === 'OK') {
-        return;
-      }
+        const chunk = await readSerialText(
+          reader,
+          APP_RESPONSE_TIMEOUT_MS,
+          text => parseCommandStatus(response + text) !== null
+        );
 
-      if (status === 'ERR') {
-        throw new Error(`${stepLabel} failed: device returned ERR`);
+        response += chunk;
+
+        const status = parseCommandStatus(response);
+        if (status === 'OK') {
+          if (APP_POST_COMMAND_DELAY_MS > 0) {
+            await sleep(APP_POST_COMMAND_DELAY_MS);
+          }
+          return;
+        }
+
+        if (status === 'ERR') {
+          throw new Error(`${stepLabel} failed: device returned ERR`);
+        }
+
+        if (attempt < APP_COMMAND_ATTEMPTS - 1) {
+          await sleep(APP_COMMAND_RETRY_DELAY_MS);
+        }
       }
 
       throw new Error(`${stepLabel} failed: timed out waiting for OK`);
