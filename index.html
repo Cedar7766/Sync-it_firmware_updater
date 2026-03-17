@@ -9,6 +9,13 @@
     #firmwareSelector { margin-right: 1em; }
     #status { margin-top: 1em; color: darkred; }
     #fileInput { margin-top: 0.5em; display: block; }
+    #startupEditor { margin-top: 2em; max-width: 420px; }
+    .startupRow { display: flex; align-items: center; gap: 0.75em; margin: 0.5em 0; }
+    .startupRow label { width: 60px; }
+    .startupRow input { flex: 1; }
+    .charCount { min-width: 52px; color: #555; font-size: 0.9em; }
+    .startupActions { display: flex; gap: 0.75em; margin-top: 1em; }
+    #startupStatus { margin-top: 1em; color: darkred; min-height: 1.2em; }
   </style>
 </head>
   <body>
@@ -33,6 +40,40 @@
   If you don't see the 'CP2102 USB to UART Bridge Controller', download the Silabs drivers from here:<br>
   <a href="https://www.silabs.com/software-and-tools/usb-to-uart-bridge-vcp-drivers?tab=downloads"target="_blank" rel="noopener noreferrer">Silabs Virtual Com port driver</a>
 </p>
+
+  <section id="startupEditor">
+    <h2>Startup Screen Text</h2>
+    <p>Read or update the 4 lines shown on the unit startup screen (max 11 characters per line)</p>
+
+    <div class="startupRow">
+      <label for="line1Input">Line 1:</label>
+      <input id="line1Input" maxlength="11">
+      <span id="line1Count" class="charCount">0 / 11</span>
+    </div>
+    <div class="startupRow">
+      <label for="line2Input">Line 2:</label>
+      <input id="line2Input" maxlength="11">
+      <span id="line2Count" class="charCount">0 / 11</span>
+    </div>
+    <div class="startupRow">
+      <label for="line3Input">Line 3:</label>
+      <input id="line3Input" maxlength="11">
+      <span id="line3Count" class="charCount">0 / 11</span>
+    </div>
+    <div class="startupRow">
+      <label for="line4Input">Line 4:</label>
+      <input id="line4Input" maxlength="11">
+      <span id="line4Count" class="charCount">0 / 11</span>
+    </div>
+
+    <div class="startupActions">
+      <button id="readStartupBtn">Read from unit</button>
+      <button id="writeStartupBtn">Update unit</button>
+    </div>
+
+    <div id="startupStatus"></div>
+  </section>
+
   <script src="avrbro.browser.js"></script>
   <script>
     const selector = document.getElementById('firmwareSelector');
@@ -40,10 +81,180 @@
     const fileInput = document.getElementById('fileInput');
     const status = document.getElementById('status');
     const progress = document.getElementById('progress');
+    const readStartupBtn = document.getElementById('readStartupBtn');
+    const writeStartupBtn = document.getElementById('writeStartupBtn');
+    const startupStatus = document.getElementById('startupStatus');
+    const startupInputs = [
+      document.getElementById('line1Input'),
+      document.getElementById('line2Input'),
+      document.getElementById('line3Input'),
+      document.getElementById('line4Input'),
+    ];
+    const startupCounts = [
+      document.getElementById('line1Count'),
+      document.getElementById('line2Count'),
+      document.getElementById('line3Count'),
+      document.getElementById('line4Count'),
+    ];
+    const APP_BAUD = 115200;
+    const MAX_CHARS = 11;
     const defaultBootloaderStart = 0x7800;
+    const textEncoder = new TextEncoder();
 
     let selectedFirmware = null;
     let userFile = null;
+
+    function sanitizeLine(value) {
+      if (value == null) return '';
+      return String(value).replace(/[\r\n|]/g, '').slice(0, MAX_CHARS);
+    }
+
+    function updateCounters() {
+      startupInputs.forEach((input, index) => {
+        input.value = sanitizeLine(input.value);
+        startupCounts[index].textContent = `${input.value.length} / ${MAX_CHARS}`;
+      });
+    }
+
+    function buildTextCommand() {
+      const [line1, line2, line3, line4] = startupInputs.map(input => sanitizeLine(input.value));
+      return `TEXT=${line1}|${line2}|${line3}|${line4}\n`;
+    }
+
+    function parseInfo(text) {
+      const lines = text.split(/\r?\n/);
+      const parsed = { l1: '', l2: '', l3: '', l4: '' };
+
+      lines.forEach(line => {
+        if (line.startsWith('L1:')) parsed.l1 = line.slice(3).trim();
+        if (line.startsWith('L2:')) parsed.l2 = line.slice(3).trim();
+        if (line.startsWith('L3:')) parsed.l3 = line.slice(3).trim();
+        if (line.startsWith('L4:')) parsed.l4 = line.slice(3).trim();
+      });
+
+      return parsed;
+    }
+
+    async function withSerial(task) {
+      if (!('serial' in navigator)) {
+        throw new Error('Web Serial API not supported');
+      }
+
+      const port = await navigator.serial.requestPort();
+      let reader = null;
+      let writer = null;
+
+      try {
+        await port.open({ baudRate: APP_BAUD });
+        writer = port.writable.getWriter();
+        reader = port.readable.getReader();
+        return await task(writer, reader);
+      } finally {
+        try {
+          if (reader) {
+            try {
+              await reader.cancel();
+            } catch (err) {
+              if (err?.name !== 'InvalidStateError') {
+                console.warn('Failed to cancel reader:', err);
+              }
+            }
+            reader.releaseLock();
+          }
+          if (writer) writer.releaseLock();
+          if (port.readable && port.writable) await port.close();
+        } catch (err) {
+          console.warn('Failed to close app serial port:', err);
+        }
+      }
+    }
+
+    async function readSerialText(reader, timeoutMs, stopWhen) {
+      const decoder = new TextDecoder();
+      const deadline = Date.now() + timeoutMs;
+      let text = '';
+
+      while (Date.now() < deadline) {
+        const remaining = deadline - Date.now();
+        const result = await Promise.race([
+          reader.read(),
+          new Promise(resolve => setTimeout(() => resolve(null), remaining)),
+        ]);
+
+        if (!result) break;
+        if (result.done) break;
+
+        text += decoder.decode(result.value, { stream: true });
+        if (stopWhen && stopWhen(text)) break;
+      }
+
+      text += decoder.decode();
+      return text;
+    }
+
+    function setStartupBusy(isBusy) {
+      readStartupBtn.disabled = isBusy;
+      writeStartupBtn.disabled = isBusy;
+    }
+
+    async function readStartup() {
+      startupStatus.textContent = 'Reading...';
+      setStartupBusy(true);
+
+      try {
+        const response = await withSerial(async (writer, reader) => {
+          await writer.write(textEncoder.encode('INFO?\n'));
+          return readSerialText(reader, 1000, text => text.includes('L4:'));
+        });
+
+        const info = parseInfo(response);
+        if (!response.includes('L1:') || !response.includes('L2:') || !response.includes('L3:') || !response.includes('L4:')) {
+          throw new Error('Incomplete INFO response');
+        }
+        startupInputs[0].value = sanitizeLine(info.l1);
+        startupInputs[1].value = sanitizeLine(info.l2);
+        startupInputs[2].value = sanitizeLine(info.l3);
+        startupInputs[3].value = sanitizeLine(info.l4);
+        updateCounters();
+        startupStatus.textContent = 'Read OK';
+      } catch (err) {
+        startupStatus.textContent = 'Read failed';
+        console.error(err);
+      } finally {
+        setStartupBusy(false);
+      }
+    }
+
+    async function writeStartup() {
+      startupStatus.textContent = 'Writing...';
+      setStartupBusy(true);
+
+      try {
+        updateCounters();
+        const command = buildTextCommand();
+        const response = await withSerial(async (writer, reader) => {
+          await writer.write(textEncoder.encode(command));
+          return readSerialText(reader, 1000);
+        });
+
+        if (response.includes('OK')) {
+          await readStartup();
+          startupStatus.textContent = 'Write OK';
+        } else {
+          startupStatus.textContent = 'Write failed';
+        }
+      } catch (err) {
+        startupStatus.textContent = 'Write error';
+        console.error(err);
+      } finally {
+        setStartupBusy(false);
+      }
+    }
+
+    startupInputs.forEach(input => input.addEventListener('input', updateCounters));
+    readStartupBtn.onclick = readStartup;
+    writeStartupBtn.onclick = writeStartup;
+    updateCounters();
 
     // Load manifest.json for GitHub firmware list
     fetch('firmware/manifest.json')
