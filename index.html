@@ -109,6 +109,7 @@
     const defaultBootloaderStart = 0x7800;
     const textEncoder = new TextEncoder();
     const PRINTABLE_ASCII_REGEX = /^[\x20-\x7E]*$/;
+    const serialTextStates = new WeakMap();
 
     let selectedFirmware = null;
     let userFile = null;
@@ -219,26 +220,100 @@
       }
     }
 
-    async function readSerialText(reader, timeoutMs, stopWhen) {
+    function getSerialTextState(reader) {
+      let state = serialTextStates.get(reader);
+      if (state) {
+        return state;
+      }
+
       const decoder = new TextDecoder();
+      state = {
+        buffer: '',
+        ended: false,
+        error: null,
+        waiters: [],
+      };
+
+      const notify = () => {
+        const waiters = state.waiters.splice(0, state.waiters.length);
+        waiters.forEach(resolve => resolve());
+      };
+
+      state.pump = (async () => {
+        try {
+          while (true) {
+            const { value, done } = await reader.read();
+            if (done) {
+              state.buffer += decoder.decode();
+              state.ended = true;
+              notify();
+              return;
+            }
+
+            if (value?.length) {
+              state.buffer += decoder.decode(value, { stream: true });
+              notify();
+            }
+          }
+        } catch (err) {
+          if (err?.name !== 'AbortError') {
+            state.error = err;
+          }
+          state.ended = true;
+          notify();
+        }
+      })();
+
+      serialTextStates.set(reader, state);
+      return state;
+    }
+
+    async function readSerialText(reader, timeoutMs, stopWhen) {
+      const state = getSerialTextState(reader);
       const deadline = Date.now() + timeoutMs;
       let text = '';
 
+      const takeBufferedText = () => {
+        if (!state.buffer) {
+          return '';
+        }
+
+        const chunk = state.buffer;
+        state.buffer = '';
+        return chunk;
+      };
+
       while (Date.now() < deadline) {
+        text += takeBufferedText();
+        if (stopWhen && stopWhen(text)) {
+          break;
+        }
+
+        if (state.error) {
+          throw state.error;
+        }
+
+        if (state.ended) {
+          break;
+        }
+
         const remaining = deadline - Date.now();
-        const result = await Promise.race([
-          reader.read(),
-          new Promise(resolve => setTimeout(() => resolve(null), remaining)),
+        if (remaining <= 0) {
+          break;
+        }
+
+        await Promise.race([
+          new Promise(resolve => state.waiters.push(resolve)),
+          new Promise(resolve => setTimeout(resolve, remaining)),
         ]);
-
-        if (!result) break;
-        if (result.done) break;
-
-        text += decoder.decode(result.value, { stream: true });
-        if (stopWhen && stopWhen(text)) break;
       }
 
-      text += decoder.decode();
+      text += takeBufferedText();
+
+      if (state.error) {
+        throw state.error;
+      }
+
       return text;
     }
 
@@ -298,6 +373,11 @@
         if (attempt < APP_COMMAND_ATTEMPTS - 1) {
           await sleep(APP_COMMAND_RETRY_DELAY_MS);
         }
+      }
+
+      const responsePreview = response.trim();
+      if (responsePreview) {
+        throw new Error(`${stepLabel} failed: timed out waiting for OK (received: ${responsePreview})`);
       }
 
       throw new Error(`${stepLabel} failed: timed out waiting for OK`);
