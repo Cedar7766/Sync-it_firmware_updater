@@ -96,8 +96,12 @@
       document.getElementById('line3Count'),
       document.getElementById('line4Count'),
     ];
-    const APP_BAUD = 115200;
+    const APP_BAUD = 57600;
     const MAX_CHARS = 11;
+    const APP_BOOT_DELAY_MS = 1200;
+    const APP_COMMAND_ATTEMPTS = 2;
+    const APP_COMMAND_RETRY_DELAY_MS = 250;
+    const APP_RESPONSE_TIMEOUT_MS = 2500;
     const defaultBootloaderStart = 0x7800;
     const textEncoder = new TextEncoder();
 
@@ -107,6 +111,10 @@
     function sanitizeLine(value) {
       if (value == null) return '';
       return String(value).replace(/[\r\n|]/g, '').slice(0, MAX_CHARS);
+    }
+
+    function sleep(ms) {
+      return new Promise(resolve => setTimeout(resolve, ms));
     }
 
     function updateCounters() {
@@ -135,11 +143,12 @@
       return parsed;
     }
 
-    async function withSerial(task) {
+    async function withSerial(task, options = {}) {
       if (!('serial' in navigator)) {
         throw new Error('Web Serial API not supported');
       }
 
+      const readyDelayMs = options.readyDelayMs ?? APP_BOOT_DELAY_MS;
       const port = await navigator.serial.requestPort();
       let reader = null;
       let writer = null;
@@ -148,6 +157,11 @@
         await port.open({ baudRate: APP_BAUD });
         writer = port.writable.getWriter();
         reader = port.readable.getReader();
+
+        if (readyDelayMs > 0) {
+          await sleep(readyDelayMs);
+        }
+
         return await task(writer, reader);
       } finally {
         try {
@@ -192,6 +206,33 @@
       return text;
     }
 
+    async function runAppCommand(command, stopWhen) {
+      return withSerial(async (writer, reader) => {
+        let response = await readSerialText(reader, 150);
+
+        for (let attempt = 0; attempt < APP_COMMAND_ATTEMPTS; attempt++) {
+          await writer.write(textEncoder.encode(command));
+
+          const chunk = await readSerialText(
+            reader,
+            APP_RESPONSE_TIMEOUT_MS,
+            stopWhen ? text => stopWhen(response + text) : undefined
+          );
+
+          response += chunk;
+          if (!stopWhen || stopWhen(response)) {
+            return response;
+          }
+
+          if (attempt < APP_COMMAND_ATTEMPTS - 1) {
+            await sleep(APP_COMMAND_RETRY_DELAY_MS);
+          }
+        }
+
+        return response;
+      });
+    }
+
     function setStartupBusy(isBusy) {
       readStartupBtn.disabled = isBusy;
       writeStartupBtn.disabled = isBusy;
@@ -202,10 +243,7 @@
       setStartupBusy(true);
 
       try {
-        const response = await withSerial(async (writer, reader) => {
-          await writer.write(textEncoder.encode('INFO?\n'));
-          return readSerialText(reader, 1000, text => text.includes('L4:'));
-        });
+        const response = await runAppCommand('INFO?\n', text => text.includes('L4:'));
 
         const info = parseInfo(response);
         if (!response.includes('L1:') || !response.includes('L2:') || !response.includes('L3:') || !response.includes('L4:')) {
@@ -232,10 +270,7 @@
       try {
         updateCounters();
         const command = buildTextCommand();
-        const response = await withSerial(async (writer, reader) => {
-          await writer.write(textEncoder.encode(command));
-          return readSerialText(reader, 1000);
-        });
+        const response = await runAppCommand(command, text => text.includes('OK'));
 
         if (response.includes('OK')) {
           await readStartup();
