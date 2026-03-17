@@ -44,27 +44,27 @@
 
   <section id="startupEditor">
     <h2>Startup Screen Text</h2>
-    <p>Read or update the 4 lines shown on the unit startup screen (max 25 printable ASCII characters per line)</p>
+    <p>Read or update the 4 lines shown on the unit startup screen (max 12 printable ASCII characters per line)</p>
 
     <div class="startupRow">
       <label for="line1Input">Line 1:</label>
-      <input id="line1Input" maxlength="25">
-      <span id="line1Count" class="charCount">0 / 25</span>
+      <input id="line1Input" maxlength="12">
+      <span id="line1Count" class="charCount">0 / 12</span>
     </div>
     <div class="startupRow">
       <label for="line2Input">Line 2:</label>
-      <input id="line2Input" maxlength="25">
-      <span id="line2Count" class="charCount">0 / 25</span>
+      <input id="line2Input" maxlength="12">
+      <span id="line2Count" class="charCount">0 / 12</span>
     </div>
     <div class="startupRow">
       <label for="line3Input">Line 3:</label>
-      <input id="line3Input" maxlength="25">
-      <span id="line3Count" class="charCount">0 / 25</span>
+      <input id="line3Input" maxlength="12">
+      <span id="line3Count" class="charCount">0 / 12</span>
     </div>
     <div class="startupRow">
       <label for="line4Input">Line 4:</label>
-      <input id="line4Input" maxlength="25">
-      <span id="line4Count" class="charCount">0 / 25</span>
+      <input id="line4Input" maxlength="12">
+      <span id="line4Count" class="charCount">0 / 12</span>
     </div>
 
     <div class="startupActions">
@@ -100,7 +100,7 @@
       document.getElementById('line4Count'),
     ];
     const APP_BAUD = 57600;
-    const MAX_CHARS = 25;
+    const MAX_CHARS = 12;
     const APP_BOOT_DELAY_MS = 1200;
     const APP_COMMAND_ATTEMPTS = 2;
     const APP_COMMAND_RETRY_DELAY_MS = 250;
