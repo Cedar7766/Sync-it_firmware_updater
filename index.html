@@ -388,22 +388,33 @@
       writeStartupBtn.disabled = isBusy;
     }
 
+    async function readStartupOverSerial(writer, reader) {
+      await readSerialText(reader, 150);
+
+      await writer.write(textEncoder.encode('INFO?\n'));
+      const response = await readSerialText(reader, APP_RESPONSE_TIMEOUT_MS, text => text.includes('END'));
+
+      const info = parseInfo(response);
+      if (!response.includes('L1:') || !response.includes('L2:') || !response.includes('L3:') || !response.includes('L4:')) {
+        throw new Error('Incomplete INFO response');
+      }
+
+      startupInputs[0].value = sanitizeDeviceLine(info.l1);
+      startupInputs[1].value = sanitizeDeviceLine(info.l2);
+      startupInputs[2].value = sanitizeDeviceLine(info.l3);
+      startupInputs[3].value = sanitizeDeviceLine(info.l4);
+      updateCounters();
+    }
+
     async function readStartup() {
       startupStatus.textContent = 'Reading...';
       setStartupBusy(true);
 
       try {
-        const response = await runAppCommand('INFO?\n', text => text.includes('L4:'));
+        await withSerial(async (writer, reader) => {
+          await readStartupOverSerial(writer, reader);
+        });
 
-        const info = parseInfo(response);
-        if (!response.includes('L1:') || !response.includes('L2:') || !response.includes('L3:') || !response.includes('L4:')) {
-          throw new Error('Incomplete INFO response');
-        }
-        startupInputs[0].value = sanitizeDeviceLine(info.l1);
-        startupInputs[1].value = sanitizeDeviceLine(info.l2);
-        startupInputs[2].value = sanitizeDeviceLine(info.l3);
-        startupInputs[3].value = sanitizeDeviceLine(info.l4);
-        updateCounters();
         startupStatus.textContent = 'Read OK';
       } catch (err) {
         startupStatus.textContent = err?.message || 'Read failed';
@@ -428,9 +439,9 @@
           await sendCommandExpectOk(writer, reader, `L3=${line3}`, 'Line 3');
           await sendCommandExpectOk(writer, reader, `L4=${line4}`, 'Line 4');
           await sendCommandExpectOk(writer, reader, 'SAVE', 'SAVE');
+          await readStartupOverSerial(writer, reader);
         });
 
-        await readStartup();
         startupStatus.textContent = 'Write OK';
       } catch (err) {
         startupStatus.textContent = err?.message || 'Write failed';
