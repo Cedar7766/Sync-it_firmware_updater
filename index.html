@@ -27,7 +27,7 @@
     <option>Loading...</option>
   </select>
 <br><br>
-  <label for="fileInput">...or upload your the HEX file sent to you by us:</label>
+  <label for="fileInput">...or upload the HEX file we sent you:</label>
   <input type="file" id="fileInput" accept=".hex">
 
   <br><br>
@@ -44,27 +44,27 @@
 
   <section id="startupEditor">
     <h2>Startup Screen Text</h2>
-    <p>Read or update the 4 lines shown on the unit startup screen (max 11 characters per line)</p>
+    <p>Read or update the 4 lines shown on the unit startup screen (max 25 printable ASCII characters per line)</p>
 
     <div class="startupRow">
       <label for="line1Input">Line 1:</label>
-      <input id="line1Input" maxlength="11">
-      <span id="line1Count" class="charCount">0 / 11</span>
+      <input id="line1Input" maxlength="25">
+      <span id="line1Count" class="charCount">0 / 25</span>
     </div>
     <div class="startupRow">
       <label for="line2Input">Line 2:</label>
-      <input id="line2Input" maxlength="11">
-      <span id="line2Count" class="charCount">0 / 11</span>
+      <input id="line2Input" maxlength="25">
+      <span id="line2Count" class="charCount">0 / 25</span>
     </div>
     <div class="startupRow">
       <label for="line3Input">Line 3:</label>
-      <input id="line3Input" maxlength="11">
-      <span id="line3Count" class="charCount">0 / 11</span>
+      <input id="line3Input" maxlength="25">
+      <span id="line3Count" class="charCount">0 / 25</span>
     </div>
     <div class="startupRow">
       <label for="line4Input">Line 4:</label>
-      <input id="line4Input" maxlength="11">
-      <span id="line4Count" class="charCount">0 / 11</span>
+      <input id="line4Input" maxlength="25">
+      <span id="line4Count" class="charCount">0 / 25</span>
     </div>
 
     <div class="startupActions">
@@ -100,20 +100,26 @@
       document.getElementById('line4Count'),
     ];
     const APP_BAUD = 57600;
-    const MAX_CHARS = 11;
+    const MAX_CHARS = 25;
     const APP_BOOT_DELAY_MS = 1200;
     const APP_COMMAND_ATTEMPTS = 2;
     const APP_COMMAND_RETRY_DELAY_MS = 250;
     const APP_RESPONSE_TIMEOUT_MS = 2500;
     const defaultBootloaderStart = 0x7800;
     const textEncoder = new TextEncoder();
+    const PRINTABLE_ASCII_REGEX = /^[\x20-\x7E]*$/;
 
     let selectedFirmware = null;
     let userFile = null;
 
-    function sanitizeLine(value) {
+    function sanitizeDeviceLine(value) {
       if (value == null) return '';
-      return String(value).replace(/[\r\n|]/g, '').slice(0, MAX_CHARS);
+      return String(value).replace(/[^\x20-\x7E]/g, '').slice(0, MAX_CHARS);
+    }
+
+    function sanitizeEditorValue(value) {
+      if (value == null) return '';
+      return String(value).replace(/[\r\n]/g, '').slice(0, MAX_CHARS);
     }
 
     function sleep(ms) {
@@ -122,14 +128,40 @@
 
     function updateCounters() {
       startupInputs.forEach((input, index) => {
-        input.value = sanitizeLine(input.value);
+        input.value = sanitizeEditorValue(input.value);
         startupCounts[index].textContent = `${input.value.length} / ${MAX_CHARS}`;
       });
     }
 
-    function buildTextCommand() {
-      const [line1, line2, line3, line4] = startupInputs.map(input => sanitizeLine(input.value));
-      return `TEXT=${line1}|${line2}|${line3}|${line4}\n`;
+    function validateStartupLines() {
+      const lines = startupInputs.map((input, index) => {
+        const value = sanitizeEditorValue(input.value);
+
+        if (value.length > MAX_CHARS) {
+          throw new Error(`Line ${index + 1} exceeds ${MAX_CHARS} characters`);
+        }
+
+        if (!PRINTABLE_ASCII_REGEX.test(value)) {
+          throw new Error(`Line ${index + 1} must use printable ASCII characters only`);
+        }
+
+        return value;
+      });
+
+      return lines;
+    }
+
+    function parseCommandStatus(text) {
+      const lines = text.replace(/\r/g, '').split('\n');
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (trimmed === 'OK' || trimmed === 'ERR') {
+          return trimmed;
+        }
+      }
+
+      return null;
     }
 
     function parseInfo(text) {
@@ -236,6 +268,27 @@
       });
     }
 
+    async function sendCommandExpectOk(writer, reader, command, stepLabel) {
+      await writer.write(textEncoder.encode(`${command}\n`));
+
+      const response = await readSerialText(
+        reader,
+        APP_RESPONSE_TIMEOUT_MS,
+        text => parseCommandStatus(text) !== null
+      );
+
+      const status = parseCommandStatus(response);
+      if (status === 'OK') {
+        return;
+      }
+
+      if (status === 'ERR') {
+        throw new Error(`${stepLabel} failed: device returned ERR`);
+      }
+
+      throw new Error(`${stepLabel} failed: timed out waiting for OK`);
+    }
+
     function setStartupBusy(isBusy) {
       readStartupBtn.disabled = isBusy;
       writeStartupBtn.disabled = isBusy;
@@ -252,14 +305,14 @@
         if (!response.includes('L1:') || !response.includes('L2:') || !response.includes('L3:') || !response.includes('L4:')) {
           throw new Error('Incomplete INFO response');
         }
-        startupInputs[0].value = sanitizeLine(info.l1);
-        startupInputs[1].value = sanitizeLine(info.l2);
-        startupInputs[2].value = sanitizeLine(info.l3);
-        startupInputs[3].value = sanitizeLine(info.l4);
+        startupInputs[0].value = sanitizeDeviceLine(info.l1);
+        startupInputs[1].value = sanitizeDeviceLine(info.l2);
+        startupInputs[2].value = sanitizeDeviceLine(info.l3);
+        startupInputs[3].value = sanitizeDeviceLine(info.l4);
         updateCounters();
         startupStatus.textContent = 'Read OK';
       } catch (err) {
-        startupStatus.textContent = 'Read failed';
+        startupStatus.textContent = err?.message || 'Read failed';
         console.error(err);
       } finally {
         setStartupBusy(false);
@@ -272,17 +325,21 @@
 
       try {
         updateCounters();
-        const command = buildTextCommand();
-        const response = await runAppCommand(command, text => text.includes('OK'));
+        const [line1, line2, line3, line4] = validateStartupLines();
 
-        if (response.includes('OK')) {
-          await readStartup();
-          startupStatus.textContent = 'Write OK';
-        } else {
-          startupStatus.textContent = 'Write failed';
-        }
+        await withSerial(async (writer, reader) => {
+          await readSerialText(reader, 150);
+          await sendCommandExpectOk(writer, reader, `L1=${line1}`, 'Line 1');
+          await sendCommandExpectOk(writer, reader, `L2=${line2}`, 'Line 2');
+          await sendCommandExpectOk(writer, reader, `L3=${line3}`, 'Line 3');
+          await sendCommandExpectOk(writer, reader, `L4=${line4}`, 'Line 4');
+          await sendCommandExpectOk(writer, reader, 'SAVE', 'SAVE');
+        });
+
+        await readStartup();
+        startupStatus.textContent = 'Write OK';
       } catch (err) {
-        startupStatus.textContent = 'Write error';
+        startupStatus.textContent = err?.message || 'Write failed';
         console.error(err);
       } finally {
         setStartupBusy(false);
