@@ -1,3 +1,8 @@
+const STK_OK = 0x10;
+const STK_INSYNC = 0x14;
+const PROGRAM_PAGE_INSYNC_TIMEOUT_MS = 750;
+const PROGRAM_PAGE_OK_TIMEOUT_MS = 1000;
+
 class AvrSerial {
   constructor(port) {
     this.port = port;
@@ -108,7 +113,7 @@ class AvrSerial {
     try {
       while (true) {
         while (this.buffer.length >= 2) {
-          if (this.buffer[0] === 0x14 && this.buffer[1] === 0x10) {
+          if (this.buffer[0] === STK_INSYNC && this.buffer[1] === STK_OK) {
             this.buffer.shift();
             this.buffer.shift();
             console.debug("STK500 response: 14 10");
@@ -182,6 +187,23 @@ class STK500v1 {
     }
   }
 
+  async _expectByte(stage, expected, timeout) {
+    let received;
+    try {
+      received = await this.serial.readByte(timeout);
+    } catch (error) {
+      console.warn(`STK500 ${stage} timeout:`, error.message);
+      throw new Error(`${stage} timeout: ${error.message}`);
+    }
+    if (received !== expected) {
+      const expectedHex = expected.toString(16).padStart(2, "0");
+      const receivedHex = received.toString(16).padStart(2, "0");
+      console.warn(`STK500 ${stage} received unexpected byte: ${receivedHex}`);
+      throw new Error(`${stage} received 0x${receivedHex}, expected 0x${expectedHex}`);
+    }
+    return received;
+  }
+
   async sync(attempts = 4) {
     this.serial.clearBufferedInput("before STK500 sync");
     for (let i = 0; i < attempts; i++) {
@@ -209,10 +231,18 @@ class STK500v1 {
     await this._expectPair("load address", 750);
   }
 
-  async programPage(data) {
+  async programPage(data, address) {
     const size = data.length;
+    const commandSentAt = performance.now();
     await this.serial.writeBytes([0x64, (size >> 8) & 0xFF, size & 0xFF, 0x46, ...data, 0x20]);
-    await this._expectPair("program page", 1500);
+    const pageLabel = address === undefined ? "" : ` at 0x${address.toString(16)}`;
+    console.info(`STK500 program page sent${pageLabel}`);
+    await this._expectByte("program page INSYNC", STK_INSYNC, PROGRAM_PAGE_INSYNC_TIMEOUT_MS);
+    const inSyncAt = performance.now();
+    console.info(`STK500 program page INSYNC received${pageLabel} after ${Math.round(inSyncAt - commandSentAt)}ms`);
+    await this._expectByte("program page final OK", STK_OK, PROGRAM_PAGE_OK_TIMEOUT_MS);
+    const okAt = performance.now();
+    console.info(`STK500 program page final OK received${pageLabel} after ${Math.round(okAt - commandSentAt)}ms (INSYNC → OK ${Math.round(okAt - inSyncAt)}ms)`);
   }
 
   async readPage(size) {
@@ -267,7 +297,7 @@ class STK500v1 {
       const [addr, data] = analysis.pages[i];
       console.info(`STK500 programming page ${i + 1}/${analysis.pages.length}, address 0x${addr.toString(16)}`);
       await this.loadAddress(addr >> 1);
-      await this.programPage(data);
+      await this.programPage(data, addr);
       onProgress?.(Math.round((i + 1) / analysis.pages.length * 100));
     }
     const verification = options.verifyBootloaderOverwrite && analysis.bootloaderOverwrite
