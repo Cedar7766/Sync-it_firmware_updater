@@ -36,7 +36,7 @@ The Sync-it toolchain currently uses the same USB serial connection for two diff
 These are separate protocols.
 
 ### Bootloader flashing mode
-- Triggered by the web updater with a 1200-baud open/close reset pulse.
+- Triggered by the web updater with explicit DTR/RTS reset pulses; a 1200-baud open/close touch remains the compatibility fallback.
 - Reconnects at 57600 baud and speaks STK500v1 binary frames.
 - Used only for flashing Intel HEX firmware.
 
@@ -51,13 +51,14 @@ The firmware update path remains unchanged.
 ### Browser-side flow
 1. User selects a hosted HEX file or uploads a local `.hex` file.
 2. The browser reads the HEX text before opening the port.
-3. The updater analyzes the address map and checks whether the image overlaps the configured bootloader region at `0x7800`.
+3. The updater analyzes the address map and checks whether the image overlaps the production bootloader region at `0x7E00`.
 4. If overlap is detected, the UI warns the user and requires explicit confirmation before proceeding.
 5. The browser requests a serial port.
-6. The port is opened at 1200 baud, held briefly, then closed to trigger bootloader entry.
-7. The same port is reopened at 57600 baud.
-8. `AvrSerial` wraps the Web Serial streams.
-9. `STK500v1.flashHex()` syncs, enters programming mode, writes 128-byte pages, optionally verifies bootloader-region writes, then leaves programming mode.
+6. The updater tries explicit DTR false→true→false, then RTS false→true→false. Each uses the 100 ms signal phases and 400 ms settle time used by the manufacturing interrogation script.
+7. If neither explicit pulse syncs, the historical 1200-baud open/close touch is used as a compatibility fallback.
+8. Each reset strategy gets a newly opened 57600-baud session and independently synced STK500v1 transport.
+9. `AvrSerial` owns a single receive pump, so a timeout never leaves a competing `reader.read()` pending.
+10. `STK500v1.flashHex()` enters programming mode after that successful sync, writes 128-byte pages, optionally verifies bootloader-region writes, then leaves programming mode.
 10. The page updates the progress bar and final status message.
 
 ### STK500v1 framing
@@ -71,7 +72,7 @@ The browser sends canonical STK500v1 request frames and expects `0x14 0x10` (`IN
 - Leave programming mode: `0x51 0x20`
 
 ### Bootloader overwrite protection
-- The browser warns before opening the port if the HEX overlaps `0x7800` and above.
+- The browser warns before opening the port if the HEX overlaps `0x7E00` and above. Production HFUSE `0xD6` selects the 512-byte `0x7E00`–`0x7FFF` boot section.
 - The flasher also rejects bootloader writes unless overwrite was explicitly allowed.
 - If overwrite is allowed, the flasher can read back bootloader-region bytes to distinguish:
   - `actualOverwrite`

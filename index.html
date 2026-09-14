@@ -106,7 +106,13 @@
     const APP_COMMAND_RETRY_DELAY_MS = 250;
     const APP_RESPONSE_TIMEOUT_MS = 2500;
     const APP_POST_COMMAND_DELAY_MS = 75;
-    const defaultBootloaderStart = 0x7800;
+    // Production HFUSE=0xD6 selects a 512-byte boot section at 0x7E00.
+    const defaultBootloaderStart = 0x7E00;
+    const BOOT_BAUD = 57600;
+    // These match the known-good manufacturing interrogation pulse cadence.
+    const RESET_STEP_MS = 100;
+    const RESET_SETTLE_MS = 400;
+    const RESET_RETRY_DELAY_MS = 150;
     const textEncoder = new TextEncoder();
     const PRINTABLE_ASCII_REGEX = /^[\x20-\x7E]*$/;
     const serialTextStates = new WeakMap();
@@ -126,6 +132,78 @@
 
     function sleep(ms) {
       return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    async function closeRawPort(port) {
+      if (port?.readable && port?.writable) await port.close();
+    }
+
+    async function resetIntoBootloader(port, method) {
+      console.info(`Bootloader reset method attempted: ${method}`);
+
+      if (method === 'TOUCH_1200') {
+        await port.open({ baudRate: 1200 });
+        await sleep(250); // Preserve the historical updater touch as a fallback.
+        await port.close();
+        await port.open({ baudRate: BOOT_BAUD });
+        await sleep(RESET_SETTLE_MS);
+      } else {
+        const selectedSignal = method === 'DTR_FTF' ? 'dataTerminalReady' : 'requestToSend';
+        const otherSignal = selectedSignal === 'dataTerminalReady' ? 'requestToSend' : 'dataTerminalReady';
+        await port.open({ baudRate: BOOT_BAUD });
+        await port.setSignals({ dataTerminalReady: false, requestToSend: false });
+        await sleep(RESET_STEP_MS);
+        await port.setSignals({ [selectedSignal]: true, [otherSignal]: false });
+        await sleep(RESET_STEP_MS);
+        await port.setSignals({ dataTerminalReady: false, requestToSend: false });
+        await sleep(RESET_STEP_MS);
+        await sleep(RESET_SETTLE_MS);
+      }
+
+      const candidate = new AvrSerial(port);
+      await candidate.open();
+      candidate.clearBufferedInput(`after ${method} reset`);
+      return candidate;
+    }
+
+    async function connectBootloader(port) {
+      const resetMethods = ['DTR_FTF', 'RTS_FTF', 'TOUCH_1200'];
+      let lastError = null;
+
+      for (const method of resetMethods) {
+        let candidate = null;
+        try {
+          status.textContent = 'Connecting to update mode…';
+          candidate = await resetIntoBootloader(port, method);
+          const uploader = new STK500v1(candidate);
+          await uploader.sync();
+          console.info(`Bootloader reset method succeeded: ${method}`);
+          return { serial: candidate, uploader, method };
+        } catch (error) {
+          lastError = error;
+          console.warn(`Bootloader reset method ${method} did not sync:`, error.message);
+          try {
+            if (candidate) await candidate.close();
+            else await closeRawPort(port);
+          } catch (closeError) {
+            console.warn(`Cleanup after ${method} failed:`, closeError);
+          }
+          await sleep(RESET_RETRY_DELAY_MS);
+        }
+      }
+      throw new Error(`No bootloader sync response after DTR, RTS, and 1200-baud reset attempts${lastError ? ` (${lastError.message})` : ''}`);
+    }
+
+    function customerUploadError(error) {
+      const message = error?.message || 'Unknown error';
+      if (message.includes('No bootloader sync response')) {
+        return 'Could not enter update mode. Reconnect the USB cable, close other serial apps, then try again.';
+      }
+      if (message.includes('verify')) return 'Upload could not be verified. Please try the update again.';
+      if (message.includes('program page') || message.includes('load address') || message.includes('enter programming mode')) {
+        return 'Programming stopped before completion. Please try the update again.';
+      }
+      return `Upload failed: ${message}`;
     }
 
     function updateCounters() {
@@ -541,27 +619,21 @@
           allowBootloaderOverwrite = true;
         }
 
-        // 2. Open serial port and reset
+        // 2. Select the serial device once; then try explicit reset methods.
         port = await navigator.serial.requestPort();
-        await port.open({ baudRate: 1200 });
-        await new Promise(r => setTimeout(r, 250));
-        await port.close();
+        const bootloader = await connectBootloader(port);
+        serial = bootloader.serial;
+        console.info(`Programming with bootloader reset method: ${bootloader.method}`);
 
-        // 3. Reconnect at bootloader baud rate
-        await port.open({ baudRate: 57600 });
-        serial = new AvrSerial(port);
-        await serial.open();
-
-        const uploader = new STK500v1(serial);
-
-        // 4. Flash it
-        const result = await uploader.flashHex(
+        // 3. Flash after the successful sync. Do not re-sync after the reset window.
+        const result = await bootloader.uploader.flashHex(
           firmwareText,
           pct => progress.value = pct,
           {
             bootloaderStart: defaultBootloaderStart,
             allowBootloaderOverwrite,
             verifyBootloaderOverwrite: allowBootloaderOverwrite,
+            skipSync: true,
           }
         );
 
@@ -579,8 +651,8 @@
           status.textContent = "✅ Upload complete!";
         }
       } catch (e) {
-        status.textContent = "❌ Upload failed: " + e.message;
-        console.error(e);
+        status.textContent = "❌ " + customerUploadError(e);
+        console.error("Firmware upload failed:", e);
       } finally {
         try {
           if (serial) await serial.close();
