@@ -21,7 +21,7 @@
 </head>
   <body>
   <img src="Sync-it logo 4x3 transparent.png" alt="Sync-it Logo" style="max-width: 200px; display: block; margin-bottom: 1em;">
-  <h1>Firmware Uploader v2</h1>
+  <h1>Firmware Uploader v3</h1>
   <label for="firmwareSelector">Choose firmware from list:</label>
   <select id="firmwareSelector">
     <option>Loading...</option>
@@ -101,11 +101,12 @@
     ];
     const APP_BAUD = 57600;
     const MAX_CHARS = 12;
-    const APP_BOOT_DELAY_MS = 4000;
+    const APP_BOOT_DELAY_MS = 1200;
     const APP_COMMAND_ATTEMPTS = 2;
     const APP_COMMAND_RETRY_DELAY_MS = 250;
     const APP_RESPONSE_TIMEOUT_MS = 2500;
     const APP_POST_COMMAND_DELAY_MS = 75;
+    const APP_INFO_ATTEMPTS = 3;
     // Temporary field diagnostics. Console only; never shown in the customer UI.
     const APP_SERIAL_DEBUG = true;
     // Production HFUSE=0xD6 selects a 512-byte boot section at 0x7E00.
@@ -522,42 +523,66 @@
       });
 
       const command = 'INFO?\n';
-      const commandSentAt = performance.now();
-      appSerialLog('INFO command sent', { command: JSON.stringify(command) });
-      await writer.write(textEncoder.encode(command));
-      const responseDiagnostics = {};
-      const response = await readSerialText(
-        reader,
-        APP_RESPONSE_TIMEOUT_MS,
-        text => text.includes('END'),
-        responseDiagnostics
-      );
+      for (let attempt = 1; attempt <= APP_INFO_ATTEMPTS; attempt++) {
+        if (attempt > 1) {
+          await sleep(APP_COMMAND_RETRY_DELAY_MS);
+          const staleText = await readSerialText(reader, 0);
+          appSerialLog('INFO retry input discarded', {
+            attempt,
+            responseLength: staleText.length,
+            rawText: JSON.stringify(staleText),
+          });
+        }
 
-      const info = parseInfo(response);
-      const fieldsSeen = {
-        end: response.includes('END'),
-        l1: response.includes('L1:'),
-        l2: response.includes('L2:'),
-        l3: response.includes('L3:'),
-        l4: response.includes('L4:'),
-      };
-      appSerialLog('INFO transaction response', {
-        commandElapsedMs: Math.round(performance.now() - commandSentAt),
-        transactionElapsedMs: Math.round(performance.now() - transactionStartedAt),
-        responseLength: response.length,
-        rawText: JSON.stringify(response),
-        fieldsSeen,
-        read: responseDiagnostics,
-      });
-      if (!fieldsSeen.l1 || !fieldsSeen.l2 || !fieldsSeen.l3 || !fieldsSeen.l4) {
-        throw new Error('Incomplete INFO response');
+        const commandSentAt = performance.now();
+        appSerialLog('INFO command sent', { attempt, command: JSON.stringify(command) });
+        await writer.write(textEncoder.encode(command));
+        const responseDiagnostics = {};
+        const response = await readSerialText(
+          reader,
+          APP_RESPONSE_TIMEOUT_MS,
+          text => text.includes('END'),
+          responseDiagnostics
+        );
+
+        const fieldsSeen = {
+          end: response.includes('END'),
+          l1: response.includes('L1:'),
+          l2: response.includes('L2:'),
+          l3: response.includes('L3:'),
+          l4: response.includes('L4:'),
+        };
+        const completeResponse = fieldsSeen.end && fieldsSeen.l1 && fieldsSeen.l2 && fieldsSeen.l3 && fieldsSeen.l4;
+        appSerialLog('INFO transaction response', {
+          attempt,
+          commandElapsedMs: Math.round(performance.now() - commandSentAt),
+          transactionElapsedMs: Math.round(performance.now() - transactionStartedAt),
+          responseLength: response.length,
+          rawText: JSON.stringify(response),
+          fieldsSeen,
+          read: responseDiagnostics,
+        });
+
+        if (completeResponse) {
+          appSerialLog('INFO transaction succeeded', { attempt });
+          const info = parseInfo(response);
+          startupInputs[0].value = sanitizeDeviceLine(info.l1);
+          startupInputs[1].value = sanitizeDeviceLine(info.l2);
+          startupInputs[2].value = sanitizeDeviceLine(info.l3);
+          startupInputs[3].value = sanitizeDeviceLine(info.l4);
+          updateCounters();
+          return;
+        }
+
+        if (attempt < APP_INFO_ATTEMPTS) {
+          appSerialLog('INFO transaction retrying', {
+            attempt,
+            reason: fieldsSeen.end ? 'response missing required fields' : responseDiagnostics.stopReason,
+          });
+        }
       }
 
-      startupInputs[0].value = sanitizeDeviceLine(info.l1);
-      startupInputs[1].value = sanitizeDeviceLine(info.l2);
-      startupInputs[2].value = sanitizeDeviceLine(info.l3);
-      startupInputs[3].value = sanitizeDeviceLine(info.l4);
-      updateCounters();
+      throw new Error('Unable to read unit information. Please try again.');
     }
 
     async function readStartup() {
