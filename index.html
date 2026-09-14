@@ -106,6 +106,8 @@
     const APP_COMMAND_RETRY_DELAY_MS = 250;
     const APP_RESPONSE_TIMEOUT_MS = 2500;
     const APP_POST_COMMAND_DELAY_MS = 75;
+    // Temporary field diagnostics. Console only; never shown in the customer UI.
+    const APP_SERIAL_DEBUG = true;
     // Production HFUSE=0xD6 selects a 512-byte boot section at 0x7E00.
     const defaultBootloaderStart = 0x7E00;
     const BOOT_BAUD = 57600;
@@ -132,6 +134,11 @@
 
     function sleep(ms) {
       return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    function appSerialLog(event, details = {}) {
+      if (!APP_SERIAL_DEBUG) return;
+      console.info(`[Sync-it app serial +${Math.round(performance.now())}ms] ${event}`, details);
     }
 
     async function closeRawPort(port) {
@@ -269,12 +276,20 @@
       let writer = null;
 
       try {
+        appSerialLog('port open requested', { baudRate: APP_BAUD, readyDelayMs });
         await port.open({ baudRate: APP_BAUD });
+        appSerialLog('port open completed');
         writer = port.writable.getWriter();
         reader = port.readable.getReader();
+        appSerialLog('reader and writer acquired');
 
         if (readyDelayMs > 0) {
+          const delayStartedAt = performance.now();
+          appSerialLog('port-open delay started', { readyDelayMs });
           await sleep(readyDelayMs);
+          appSerialLog('port-open delay completed', {
+            elapsedMs: Math.round(performance.now() - delayStartedAt),
+          });
         }
 
         return await task(writer, reader);
@@ -329,7 +344,13 @@
             }
 
             if (value?.length) {
-              state.buffer += decoder.decode(value, { stream: true });
+              const chunk = decoder.decode(value, { stream: true });
+              state.buffer += chunk;
+              appSerialLog('RX chunk', {
+                bytes: value.length,
+                text: JSON.stringify(chunk),
+                bufferedCharacters: state.buffer.length,
+              });
               notify();
             }
           }
@@ -346,10 +367,25 @@
       return state;
     }
 
-    async function readSerialText(reader, timeoutMs, stopWhen) {
+    async function readSerialText(reader, timeoutMs, stopWhen, diagnostics) {
       const state = getSerialTextState(reader);
       const deadline = Date.now() + timeoutMs;
+      const startedAt = performance.now();
       let text = '';
+      let stopReason = 'timeout expired';
+
+      const recordCompletion = () => {
+        const details = {
+          timeoutMs,
+          elapsedMs: Math.round(performance.now() - startedAt),
+          responseLength: text.length,
+          stopReason,
+          streamEnded: state.ended,
+          serialError: state.error ? String(state.error.message || state.error) : null,
+        };
+        if (diagnostics) Object.assign(diagnostics, details);
+        appSerialLog('read completed', details);
+      };
 
       const takeBufferedText = () => {
         if (!state.buffer) {
@@ -364,14 +400,18 @@
       while (Date.now() < deadline) {
         text += takeBufferedText();
         if (stopWhen && stopWhen(text)) {
+          stopReason = 'stop condition matched';
           break;
         }
 
         if (state.error) {
+          stopReason = 'serial error occurred';
+          recordCompletion();
           throw state.error;
         }
 
         if (state.ended) {
+          stopReason = 'stream ended';
           break;
         }
 
@@ -389,8 +429,12 @@
       text += takeBufferedText();
 
       if (state.error) {
+        stopReason = 'serial error occurred';
+        recordCompletion();
         throw state.error;
       }
+
+      recordCompletion();
 
       return text;
     }
@@ -467,13 +511,45 @@
     }
 
     async function readStartupOverSerial(writer, reader) {
-      await readSerialText(reader, 150);
+      const transactionStartedAt = performance.now();
+      const preCommandDiagnostics = {};
+      const preCommandText = await readSerialText(reader, 150, undefined, preCommandDiagnostics);
+      appSerialLog('INFO transaction pre-command input', {
+        receivedAnyBytes: preCommandText.length > 0,
+        responseLength: preCommandText.length,
+        rawText: JSON.stringify(preCommandText),
+        read: preCommandDiagnostics,
+      });
 
-      await writer.write(textEncoder.encode('INFO?\n'));
-      const response = await readSerialText(reader, APP_RESPONSE_TIMEOUT_MS, text => text.includes('END'));
+      const command = 'INFO?\n';
+      const commandSentAt = performance.now();
+      appSerialLog('INFO command sent', { command: JSON.stringify(command) });
+      await writer.write(textEncoder.encode(command));
+      const responseDiagnostics = {};
+      const response = await readSerialText(
+        reader,
+        APP_RESPONSE_TIMEOUT_MS,
+        text => text.includes('END'),
+        responseDiagnostics
+      );
 
       const info = parseInfo(response);
-      if (!response.includes('L1:') || !response.includes('L2:') || !response.includes('L3:') || !response.includes('L4:')) {
+      const fieldsSeen = {
+        end: response.includes('END'),
+        l1: response.includes('L1:'),
+        l2: response.includes('L2:'),
+        l3: response.includes('L3:'),
+        l4: response.includes('L4:'),
+      };
+      appSerialLog('INFO transaction response', {
+        commandElapsedMs: Math.round(performance.now() - commandSentAt),
+        transactionElapsedMs: Math.round(performance.now() - transactionStartedAt),
+        responseLength: response.length,
+        rawText: JSON.stringify(response),
+        fieldsSeen,
+        read: responseDiagnostics,
+      });
+      if (!fieldsSeen.l1 || !fieldsSeen.l2 || !fieldsSeen.l3 || !fieldsSeen.l4) {
         throw new Error('Incomplete INFO response');
       }
 
