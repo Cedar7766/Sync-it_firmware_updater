@@ -78,6 +78,7 @@
   <p class="contactNote">Need help using the updater tool? Contact <a href="mailto:info@sync-it.co.uk">info@sync-it.co.uk</a>.</p>
 
   <script src="avrbro.browser.js?v=d7bec8f"></script>
+  <script src="startup-layout.js"></script>
   <script>
     const selector = document.getElementById('firmwareSelector');
     const uploadBtn = document.getElementById('uploadBtn');
@@ -253,17 +254,7 @@
     }
 
     function parseInfo(text) {
-      const lines = text.split(/\r?\n/);
-      const parsed = { l1: '', l2: '', l3: '', l4: '' };
-
-      lines.forEach(line => {
-        if (line.startsWith('L1:')) parsed.l1 = line.slice(3).trim();
-        if (line.startsWith('L2:')) parsed.l2 = line.slice(3).trim();
-        if (line.startsWith('L3:')) parsed.l3 = line.slice(3).trim();
-        if (line.startsWith('L4:')) parsed.l4 = line.slice(3).trim();
-      });
-
-      return parsed;
+      return SyncItStartupLayout.parseInfo(text);
     }
 
     async function withSerial(task, options = {}) {
@@ -506,12 +497,43 @@
       throw new Error(`${stepLabel} failed: timed out waiting for OK`);
     }
 
+    async function sendCommandExpectExactlyOneOk(writer, reader, command, stepLabel) {
+      const preCommandText = await readSerialText(reader, 150);
+      if (preCommandText.trim()) {
+        throw new Error(`${stepLabel} failed: unexpected serial input before command`);
+      }
+
+      await writer.write(textEncoder.encode(`${command}\n`));
+      const response = await readSerialText(
+        reader,
+        APP_RESPONSE_TIMEOUT_MS,
+        text => /(?:^|\n)(?:OK|ERR)\r?\n?$/.test(text)
+      );
+      if (!SyncItStartupLayout.isExactlyOneOk(response)) {
+        throw new Error(`${stepLabel} failed: expected exactly one OK response`);
+      }
+
+      await sleep(APP_POST_COMMAND_DELAY_MS);
+      const trailingText = await readSerialText(reader, 0);
+      if (trailingText.trim()) {
+        throw new Error(`${stepLabel} failed: unexpected trailing serial input`);
+      }
+    }
+
     function setStartupBusy(isBusy) {
       readStartupBtn.disabled = isBusy;
       writeStartupBtn.disabled = isBusy;
     }
 
-    async function readStartupOverSerial(writer, reader) {
+    function applyStartupInfo(info) {
+      startupInputs[0].value = sanitizeDeviceLine(info.l1);
+      startupInputs[1].value = sanitizeDeviceLine(info.l2);
+      startupInputs[2].value = sanitizeDeviceLine(info.l3);
+      startupInputs[3].value = sanitizeDeviceLine(info.l4);
+      updateCounters();
+    }
+
+    async function requestStartupInfo(writer, reader) {
       const transactionStartedAt = performance.now();
       const preCommandDiagnostics = {};
       const preCommandText = await readSerialText(reader, 150, undefined, preCommandDiagnostics);
@@ -541,43 +563,37 @@
         const response = await readSerialText(
           reader,
           APP_RESPONSE_TIMEOUT_MS,
-          text => text.includes('END'),
+          text => /(?:^|\n)END\r?\n?$/.test(text),
           responseDiagnostics
         );
 
-        const fieldsSeen = {
-          end: response.includes('END'),
-          l1: response.includes('L1:'),
-          l2: response.includes('L2:'),
-          l3: response.includes('L3:'),
-          l4: response.includes('L4:'),
-        };
-        const completeResponse = fieldsSeen.end && fieldsSeen.l1 && fieldsSeen.l2 && fieldsSeen.l3 && fieldsSeen.l4;
+        let info = null;
+        let parseError = null;
+        try {
+          info = parseInfo(response);
+        } catch (error) {
+          parseError = error;
+        }
         appSerialLog('INFO transaction response', {
           attempt,
           commandElapsedMs: Math.round(performance.now() - commandSentAt),
           transactionElapsedMs: Math.round(performance.now() - transactionStartedAt),
           responseLength: response.length,
           rawText: JSON.stringify(response),
-          fieldsSeen,
+          parsed: Boolean(info),
+          parseError: parseError?.message || null,
           read: responseDiagnostics,
         });
 
-        if (completeResponse) {
+        if (info) {
           appSerialLog('INFO transaction succeeded', { attempt });
-          const info = parseInfo(response);
-          startupInputs[0].value = sanitizeDeviceLine(info.l1);
-          startupInputs[1].value = sanitizeDeviceLine(info.l2);
-          startupInputs[2].value = sanitizeDeviceLine(info.l3);
-          startupInputs[3].value = sanitizeDeviceLine(info.l4);
-          updateCounters();
-          return;
+          return info;
         }
 
         if (attempt < APP_INFO_ATTEMPTS) {
           appSerialLog('INFO transaction retrying', {
             attempt,
-            reason: fieldsSeen.end ? 'response missing required fields' : responseDiagnostics.stopReason,
+            reason: parseError?.message || responseDiagnostics.stopReason,
           });
         }
       }
@@ -585,12 +601,18 @@
       throw new Error('Unable to read unit information. Please try again.');
     }
 
+    async function readStartupOverSerial(writer, reader) {
+      const info = await requestStartupInfo(writer, reader);
+      applyStartupInfo(info);
+      return info;
+    }
+
     async function readStartup() {
       startupStatus.textContent = 'Reading...';
       setStartupBusy(true);
 
       try {
-        await withSerial(async (writer, reader) => {
+        const result = await withSerial(async (writer, reader) => {
           await readStartupOverSerial(writer, reader);
         });
 
@@ -612,16 +634,30 @@
         const [line1, line2, line3, line4] = validateStartupLines();
 
         await withSerial(async (writer, reader) => {
-          await readSerialText(reader, 150);
-          await sendCommandExpectOk(writer, reader, `L1=${line1}`, 'Line 1');
-          await sendCommandExpectOk(writer, reader, `L2=${line2}`, 'Line 2');
-          await sendCommandExpectOk(writer, reader, `L3=${line3}`, 'Line 3');
-          await sendCommandExpectOk(writer, reader, `L4=${line4}`, 'Line 4');
-          await sendCommandExpectOk(writer, reader, 'SAVE', 'SAVE');
+          const result = await SyncItStartupLayout.runStartupTextUpdate({
+            readInfo: () => requestStartupInfo(writer, reader),
+            confirmRepair: async () => window.confirm([
+              'Lines 1 and 2 currently share the same vertical position.',
+              '',
+              'Restore the standard startup positions (0, 2, 4, 6)?',
+              'This permanently changes the layout but preserves the current text, font, and letter spacing.',
+            ].join('\n')),
+            repairLayout: () => sendCommandExpectExactlyOneOk(writer, reader, 'LAYOUT=DEFAULT', 'Startup-layout repair'),
+            writeText: async () => {
+              await sendCommandExpectOk(writer, reader, `L1=${line1}`, 'Line 1');
+              await sendCommandExpectOk(writer, reader, `L2=${line2}`, 'Line 2');
+              await sendCommandExpectOk(writer, reader, `L3=${line3}`, 'Line 3');
+              await sendCommandExpectOk(writer, reader, `L4=${line4}`, 'Line 4');
+              await sendCommandExpectOk(writer, reader, 'SAVE', 'SAVE');
+            },
+          });
+
+          if (result.cancelled) return result;
           await readStartupOverSerial(writer, reader);
+          return result;
         });
 
-        startupStatus.textContent = 'Write OK';
+        startupStatus.textContent = result.cancelled ? 'Update cancelled; no changes were made.' : 'Write OK';
       } catch (err) {
         startupStatus.textContent = err?.message || 'Write failed';
         console.error(err);

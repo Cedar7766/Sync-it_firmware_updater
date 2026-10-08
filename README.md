@@ -14,6 +14,8 @@ Production Sync-it firmware and the production Optiboot bootloader are unchanged
 
 For the legacy Watterott Optiboot Web Serial failure investigation and resolution, see [the October 2026 incident report](docs/legacy-watterott-webserial-failure-2026-10.md).
 
+For the v3.54 startup-layout EEPROM recovery, browser preflight, and completed legacy-hardware validation, see [the startup-layout recovery record](docs/v3.54-startup-layout-recovery.md).
+
 ## Repositories And Key Files
 
 ### Web updater repository
@@ -129,7 +131,9 @@ Typical fields include:
 - `L3:...`
 - `L4:...`
 - `SCREEN=1` or `0`
-- `FONT=...`, `P1=...`..`P4=...`, `S1=...`..`S4=...` when `SCREEN=1`
+- v3.54 and later: `FONT=...`, `P1=...`..`P4=...`, and `S1=...`..`S4=...`
+  regardless of `SCREEN`, plus `LAYOUT_CAP=DEFAULT1` and `LAYOUT_VER=1` when
+  the persisted startup layout marker validates (`0` otherwise)
 - `END`
 
 ### Startup text write protocol
@@ -191,7 +195,9 @@ When the user clicks read:
 
 The INFO retry is a bounded application-readiness handshake, not redundant retrying. Do not replace it with an arbitrary long fixed startup delay: once ready, the application responds quickly, while normal units should remain fast on the first attempt.
 
-The browser does not use `SCREEN=`, `FONT=`, `P1`..`P4`, or `S1`..`S4` to drive the current editor UI.
+Before updating text, the browser uses `SCREEN=`, `FONT=`, `P1`..`P4`,
+`S1`..`S4`, and the v3.54 layout capability/marker fields to verify that the
+layout can be edited safely. It does not edit font or spacing.
 
 ### Browser write flow
 When the user clicks update:
@@ -308,7 +314,11 @@ The flow is:
 2. The personalised screen is shown if enabled by the startup-screen state machine.
 3. Each line is centered using `oled.strWidth(...)` and the stored Y position / spacing values.
 
-The browser currently edits only line text. It does not edit font, Y positions, or spacing values, but those values remain part of the device-side saved configuration and are visible in `INFO?` output when `SCREEN=1`.
+The browser normally edits only line text. It does not edit font or spacing;
+those values remain part of the device-side saved configuration and are visible
+in v3.54 `INFO?` output regardless of `SCREEN`. The single exception is the
+confirmed legacy `0,0,4,6` overlap, where the user may explicitly approve
+`LAYOUT=DEFAULT` to restore only the standard Y positions.
 
 ## Sleep/Wake And Serial Availability
 The device keeps the application serial interface available during normal operation and restores it after wake:
