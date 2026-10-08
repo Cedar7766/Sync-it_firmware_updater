@@ -10,6 +10,10 @@ This document describes both serial interactions currently implemented across th
 
 The goal is to document the full contract between the web page and the AVR firmware, including request/response behavior, persistence, validation, and the practical display limits seen by users.
 
+Production Sync-it firmware and the production Optiboot bootloader are unchanged. The reliability measures documented here are host-side Web Serial updater behavior only.
+
+For the legacy Watterott Optiboot Web Serial failure investigation and resolution, see [the October 2026 incident report](docs/legacy-watterott-webserial-failure-2026-10.md).
+
 ## Repositories And Key Files
 
 ### Web updater repository
@@ -59,7 +63,7 @@ The firmware update path remains unchanged.
 8. Each reset strategy gets a newly opened 57600-baud session and independently synced STK500v1 transport.
 9. `AvrSerial` owns a single receive pump, so a timeout never leaves a competing `reader.read()` pending.
 10. `STK500v1.flashHex()` enters programming mode after that successful sync, writes 128-byte pages, optionally verifies bootloader-region writes, then leaves programming mode.
-10. The page updates the progress bar and final status message.
+11. The page updates the progress bar and final status message.
 
 ### STK500v1 framing
 The browser sends canonical STK500v1 request frames and expects `0x14 0x10` (`INSYNC`, `OK`) responses.
@@ -77,6 +81,12 @@ The browser sends canonical STK500v1 request frames and expects `0x14 0x10` (`IN
 - If overwrite is allowed, the flasher can read back bootloader-region bytes to distinguish:
   - `actualOverwrite`
   - `protected`
+
+### Web Serial robustness notes
+- Explicit DTR/RTS reset fallbacks exist for deployed-unit, USB-UART bridge, driver, and browser timing differences. A method that succeeds is observational; it does not establish that a unit uniquely requires that reset method.
+- Serial reads have one owner per browser session: the receive pump buffers input and timed waits never start competing `reader.read()` calls. Keep this architecture so retries remain valid.
+- Optiboot sends `STK_INSYNC` (`0x14`) after accepting `STK_PROG_PAGE`, writes the flash page, then sends final `STK_OK` (`0x10`). Page programming therefore validates these bytes in stages, with a separate completion timeout after `0x14`; do not collapse this into an immediate-pair check.
+- The bootloader-protection boundary is `0x7E00`, derived from production HFUSE `0xD6` and its 512-byte boot section. Do not revert it to `0x7800`.
 
 ## Application Serial Protocol For Startup Text
 The startup-text editor uses a small line-oriented ASCII protocol implemented in `src/serialID.cpp`.
@@ -173,11 +183,13 @@ This means:
 ### Browser read flow
 When the user clicks read:
 1. The page opens a Web Serial session at 57600 baud.
-2. It waits for the application boot delay configured in the page.
-3. It sends `INFO?\n`.
-4. It reads text until it has seen enough output to parse `L1:` through `L4:`.
-5. It extracts those four lines and updates the four inputs.
-6. It ignores the rest of the `INFO?` fields for UI purposes.
+2. It waits for the normal application startup delay (currently 1200 ms).
+3. It drains pre-existing input, then sends `INFO?\n`.
+4. It accepts a response only when it contains `END` plus `L1:` through `L4:`.
+5. If the application is not ready, it retries `INFO?` up to three times with a short delay, discarding buffered late text between attempts.
+6. It extracts the four lines and updates the inputs, ignoring the other `INFO?` fields for UI purposes.
+
+The INFO retry is a bounded application-readiness handshake, not redundant retrying. Do not replace it with an arbitrary long fixed startup delay: once ready, the application responds quickly, while normal units should remain fast on the first attempt.
 
 The browser does not use `SCREEN=`, `FONT=`, `P1`..`P4`, or `S1`..`S4` to drive the current editor UI.
 
