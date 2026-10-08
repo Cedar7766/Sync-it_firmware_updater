@@ -21,9 +21,26 @@
     return number;
   }
 
+  // The INFO? block is terminated by an END line that some units follow with
+  // stray framing bytes (the firmware emits a NUL terminator after "END\r\n").
+  // Only trailing CR, LF and NUL bytes after END are tolerated; any NUL or other
+  // data elsewhere still marks the frame malformed.
+  function stripTrailingFraming(text) {
+    return String(text).replace(/[\r\n\0]+$/, '');
+  }
+
+  // True once the accumulated serial text contains a genuine terminal END line
+  // followed only by trailing CR, LF or NUL bytes. The serial reader uses this
+  // to stop as soon as the block completes instead of waiting out the full
+  // response timeout (a NUL arriving after END must not defeat it).
+  function isCompleteInfoResponse(text) {
+    return /(?:^|\n)END[\r\n\0]*$/.test(String(text));
+  }
+
   function parseInfo(text) {
-    const lines = String(text).replace(/\r/g, '').split('\n');
-    if (lines[lines.length - 1] === '') lines.pop();
+    const normalized = stripTrailingFraming(text);
+    if (normalized.includes('\0')) throw new Error('INFO response contains an unexpected NUL byte');
+    const lines = normalized.replace(/\r/g, '').split('\n');
     if (lines.pop() !== 'END') throw new Error('INFO response is missing a terminal END line');
 
     const values = Object.create(null);
@@ -125,5 +142,5 @@
     return { repaired: true, cancelled: false };
   }
 
-  return { STANDARD_POSITIONS, parseInfo, assessLayout, isExactlyOneOk, runStartupTextUpdate };
+  return { STANDARD_POSITIONS, parseInfo, isCompleteInfoResponse, assessLayout, isExactlyOneOk, runStartupTextUpdate };
 });

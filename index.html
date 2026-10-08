@@ -78,7 +78,7 @@
   <p class="contactNote">Need help using the updater tool? Contact <a href="mailto:info@sync-it.co.uk">info@sync-it.co.uk</a>.</p>
 
   <script src="avrbro.browser.js?v=d7bec8f"></script>
-  <script src="startup-layout.js"></script>
+  <script src="startup-layout.js?v=e14bb81a"></script>
   <script>
     const selector = document.getElementById('firmwareSelector');
     const uploadBtn = document.getElementById('uploadBtn');
@@ -103,6 +103,10 @@
     const APP_BAUD = 57600;
     const MAX_CHARS = 12;
     const APP_BOOT_DELAY_MS = 1200;
+    // Production startup lasts at most 1500 ms (main) + 2100 ms
+    // (personalised) + 1000 ms (battery).  This 400 ms margin is used only
+    // before a text write because opening the serial port resets the unit.
+    const APP_WRITE_READY_DELAY_MS = 5000;
     const APP_COMMAND_ATTEMPTS = 2;
     const APP_COMMAND_RETRY_DELAY_MS = 250;
     const APP_RESPONSE_TIMEOUT_MS = 2500;
@@ -240,11 +244,24 @@
       return lines;
     }
 
+    // NUL bytes are firmware framing padding only (for example the extra byte
+    // after the INFO? "END\r\n" line). They are never valid data in this ASCII
+    // command protocol, so command replies may ignore them. INFO? validation
+    // deliberately does NOT use these helpers: parseInfo still rejects an
+    // embedded NUL as malformed.
+    function stripFramingNuls(text) {
+      return String(text).replace(/\0/g, '');
+    }
+
+    function hasMeaningfulInput(text) {
+      return /[^\r\n\0]/.test(String(text));
+    }
+
     function parseCommandStatus(text) {
-      const lines = text.replace(/\r/g, '').split('\n');
+      const lines = String(text).replace(/\r/g, '').split('\n');
 
       for (const line of lines) {
-        const trimmed = line.trim();
+        const trimmed = stripFramingNuls(line).trim();
         if (trimmed === 'OK' || trimmed === 'ERR') {
           return trimmed;
         }
@@ -336,6 +353,9 @@
             }
 
             if (value?.length) {
+              // Deliver the raw text. Embedded NUL bytes must reach INFO? parsing
+              // so a malformed frame is rejected rather than silently repaired;
+              // only trailing NUL padding is tolerated, where replies are read.
               const chunk = decoder.decode(value, { stream: true });
               state.buffer += chunk;
               appSerialLog('RX chunk', {
@@ -489,7 +509,7 @@
         }
       }
 
-      const responsePreview = response.trim();
+      const responsePreview = stripFramingNuls(response).trim();
       if (responsePreview) {
         throw new Error(`${stepLabel} failed: timed out waiting for OK (received: ${responsePreview})`);
       }
@@ -499,7 +519,7 @@
 
     async function sendCommandExpectExactlyOneOk(writer, reader, command, stepLabel) {
       const preCommandText = await readSerialText(reader, 150);
-      if (preCommandText.trim()) {
+      if (hasMeaningfulInput(preCommandText)) {
         throw new Error(`${stepLabel} failed: unexpected serial input before command`);
       }
 
@@ -507,15 +527,15 @@
       const response = await readSerialText(
         reader,
         APP_RESPONSE_TIMEOUT_MS,
-        text => /(?:^|\n)(?:OK|ERR)\r?\n?$/.test(text)
+        text => /(?:^|\n)(?:OK|ERR)\r?\n?$/.test(stripFramingNuls(text))
       );
-      if (!SyncItStartupLayout.isExactlyOneOk(response)) {
+      if (!SyncItStartupLayout.isExactlyOneOk(stripFramingNuls(response))) {
         throw new Error(`${stepLabel} failed: expected exactly one OK response`);
       }
 
       await sleep(APP_POST_COMMAND_DELAY_MS);
       const trailingText = await readSerialText(reader, 0);
-      if (trailingText.trim()) {
+      if (hasMeaningfulInput(trailingText)) {
         throw new Error(`${stepLabel} failed: unexpected trailing serial input`);
       }
     }
@@ -531,6 +551,15 @@
       startupInputs[2].value = sanitizeDeviceLine(info.l3);
       startupInputs[3].value = sanitizeDeviceLine(info.l4);
       updateCounters();
+    }
+
+    function verifySavedStartupText(info, expectedLines) {
+      const actualLines = [info.l1, info.l2, info.l3, info.l4];
+      for (let index = 0; index < expectedLines.length; index++) {
+        if (actualLines[index] !== expectedLines[index]) {
+          throw new Error(`Saved startup text could not be verified (line ${index + 1})`);
+        }
+      }
     }
 
     async function requestStartupInfo(writer, reader) {
@@ -563,7 +592,7 @@
         const response = await readSerialText(
           reader,
           APP_RESPONSE_TIMEOUT_MS,
-          text => /(?:^|\n)END\r?\n?$/.test(text),
+          SyncItStartupLayout.isCompleteInfoResponse,
           responseDiagnostics
         );
 
@@ -633,7 +662,9 @@
         updateCounters();
         const [line1, line2, line3, line4] = validateStartupLines();
 
-        await withSerial(async (writer, reader) => {
+        startupStatus.textContent = 'Waiting for Sync-it to finish starting…';
+        const updateResult = await withSerial(async (writer, reader) => {
+          startupStatus.textContent = 'Writing...';
           const result = await SyncItStartupLayout.runStartupTextUpdate({
             readInfo: () => requestStartupInfo(writer, reader),
             confirmRepair: async () => window.confirm([
@@ -653,11 +684,14 @@
           });
 
           if (result.cancelled) return result;
-          await readStartupOverSerial(writer, reader);
+          const verifiedInfo = await readStartupOverSerial(writer, reader);
+          verifySavedStartupText(verifiedInfo, [line1, line2, line3, line4]);
           return result;
-        });
+        }, { readyDelayMs: APP_WRITE_READY_DELAY_MS });
 
-        startupStatus.textContent = result.cancelled ? 'Update cancelled; no changes were made.' : 'Write OK';
+        startupStatus.textContent = updateResult.cancelled
+          ? 'Update cancelled; no changes were made.'
+          : 'Write OK. Disconnect and reconnect the unit to display the completed startup text.';
       } catch (err) {
         startupStatus.textContent = err?.message || 'Write failed';
         console.error(err);
