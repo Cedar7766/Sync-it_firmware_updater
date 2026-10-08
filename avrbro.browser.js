@@ -2,6 +2,7 @@ const STK_OK = 0x10;
 const STK_INSYNC = 0x14;
 const PROGRAM_PAGE_INSYNC_TIMEOUT_MS = 750;
 const PROGRAM_PAGE_OK_TIMEOUT_MS = 1000;
+const SYNC_QUIET_WINDOW_MS = 25;
 
 class AvrSerial {
   constructor(port) {
@@ -66,8 +67,23 @@ class AvrSerial {
 
   clearBufferedInput(reason) {
     if (!this.buffer.length) return;
-    console.debug(`Discarding ${this.buffer.length} stale STK500 byte(s) ${reason}`);
+    console.warn(`Discarding buffered STK500 byte(s) ${reason}:`, this._formatBytes(this.buffer));
     this.buffer.length = 0;
+  }
+
+  _formatBytes(bytes) {
+    return bytes.map(byte => byte.toString(16).padStart(2, "0")).join(" ");
+  }
+
+  assertNoBufferedInput(stage) {
+    if (!this.buffer.length) return;
+    throw new Error(`${stage}: unexpected buffered STK500 byte(s): ${this._formatBytes(this.buffer)}`);
+  }
+
+  async expectQuietInput(timeout, stage) {
+    if (this.buffer.length || await this._waitForInput(timeout)) {
+      throw new Error(`${stage}: unexpected STK500 byte(s): ${this._formatBytes(this.buffer)}`);
+    }
   }
 
   async _waitForInput(timeout) {
@@ -109,26 +125,13 @@ class AvrSerial {
     if (this._readingPair) throw new Error("readBytePair() already in progress");
     this._readingPair = true;
     const deadline = performance.now() + timeout;
-    let discarded = 0;
     try {
-      while (true) {
-        while (this.buffer.length >= 2) {
-          if (this.buffer[0] === STK_INSYNC && this.buffer[1] === STK_OK) {
-            this.buffer.shift();
-            this.buffer.shift();
-            console.debug("STK500 response: 14 10");
-            return [0x14, 0x10];
-          }
-          const byte = this.buffer.shift();
-          discarded += 1;
-          console.warn("STK500 malformed response byte discarded:", byte.toString(16).padStart(2, "0"));
-        }
-        const remaining = deadline - performance.now();
-        if (remaining <= 0 || !await this._waitForInput(remaining)) {
-          const suffix = discarded ? ` after discarding ${discarded} malformed byte(s)` : "";
-          throw new Error(`Read timeout (pair)${suffix}`);
-        }
-      }
+      const first = await this.readByte(Math.max(0, deadline - performance.now()));
+      if (first !== STK_INSYNC) throw new Error(`Unexpected response byte 0x${first.toString(16).padStart(2, "0")}, expected 0x14`);
+      const second = await this.readByte(Math.max(0, deadline - performance.now()));
+      if (second !== STK_OK) throw new Error(`Unexpected response byte 0x${second.toString(16).padStart(2, "0")}, expected 0x10`);
+      console.debug("STK500 response: 14 10");
+      return [STK_INSYNC, STK_OK];
     } finally {
       this._readingPair = false;
     }
@@ -178,6 +181,12 @@ function analyzeHex(hexText, options = {}) {
 class STK500v1 {
   constructor(serial) { this.serial = serial; }
 
+  async _sendAndExpectPair(stage, bytes, timeout) {
+    this.serial.assertNoBufferedInput(`before ${stage}`);
+    await this.serial.writeBytes(bytes);
+    return this._expectPair(stage, timeout);
+  }
+
   async _expectPair(stage, timeout) {
     try {
       return await this.serial.readBytePair(timeout);
@@ -205,12 +214,14 @@ class STK500v1 {
   }
 
   async sync(attempts = 4) {
-    this.serial.clearBufferedInput("before STK500 sync");
     for (let i = 0; i < attempts; i++) {
+      this.serial.clearBufferedInput(`before STK500 sync attempt ${i + 1}`);
       console.info(`STK500 sync attempt ${i + 1}/${attempts}`);
-      await this.serial.writeBytes([0x30, 0x20]);
       try {
-        await this._expectPair("sync", 350);
+        await this._sendAndExpectPair("sync", [0x30, 0x20], 350);
+        // A successful retry is not usable until the link is quiet.  Otherwise a
+        // late response from the preceding GET_SYNC can acknowledge ENTER_PROGMODE.
+        await this.serial.expectQuietInput(SYNC_QUIET_WINDOW_MS, "after sync");
         console.info("STK500 sync succeeded");
         return;
       } catch (error) {
@@ -222,18 +233,17 @@ class STK500v1 {
   }
 
   async enterProgrammingMode() {
-    await this.serial.writeBytes([0x50, 0x20]);
-    await this._expectPair("enter programming mode", 750);
+    await this._sendAndExpectPair("enter programming mode", [0x50, 0x20], 750);
   }
 
   async loadAddress(addr) {
-    await this.serial.writeBytes([0x55, addr & 0xFF, (addr >> 8) & 0xFF, 0x20]);
-    await this._expectPair("load address", 750);
+    await this._sendAndExpectPair("load address", [0x55, addr & 0xFF, (addr >> 8) & 0xFF, 0x20], 750);
   }
 
   async programPage(data, address) {
     const size = data.length;
     const commandSentAt = performance.now();
+    this.serial.assertNoBufferedInput("before program page");
     await this.serial.writeBytes([0x64, (size >> 8) & 0xFF, size & 0xFF, 0x46, ...data, 0x20]);
     const pageLabel = address === undefined ? "" : ` at 0x${address.toString(16)}`;
     console.info(`STK500 program page sent${pageLabel}`);
@@ -246,6 +256,7 @@ class STK500v1 {
   }
 
   async readPage(size) {
+    this.serial.assertNoBufferedInput("before verify read");
     await this.serial.writeBytes([0x74, (size >> 8) & 0xFF, size & 0xFF, 0x46, 0x20]);
     const start = await this.serial.readByte(1000);
     if (start !== 0x14) throw new Error("verify read: malformed response start");
@@ -256,8 +267,7 @@ class STK500v1 {
   }
 
   async leaveProgrammingMode() {
-    await this.serial.writeBytes([0x51, 0x20]);
-    await this._expectPair("leave programming mode", 750);
+    await this._sendAndExpectPair("leave programming mode", [0x51, 0x20], 750);
   }
 
   async verifyBootloaderRegion(analysis) {
