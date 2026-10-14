@@ -243,14 +243,14 @@ test('a malformed INFO response blocks every EEPROM-modifying command', async ()
   assert.deepEqual(page.port.writes, ['INFO?\n', 'INFO?\n', 'INFO?\n']);
 });
 
-test('the recovery sequence confirms, repairs, verifies, then writes text', async () => {
+test('a markerless legacy v3.54 layout confirms, recovers, verifies, then writes text', async () => {
   const page = loadPage({
     confirmResult: true,
     onCommand: (command, port) => {
       if (command === 'INFO?\n') {
         const infoCalls = page.port.writes.filter(w => w === 'INFO?\n').length;
-        // First read sees the legacy overlap; later reads see the repaired layout.
-        port.enqueue(infoCalls === 1 ? infoBlock({ positions: [0, 0, 4, 6] }) : infoBlock());
+        // First read has no verified marker; later reads show the recovered layout.
+        port.enqueue(infoCalls === 1 ? infoBlock({ layoutVersion: 0 }) : infoBlock());
         return;
       }
       if (command === 'LAYOUT=DEFAULT\n') { port.enqueue(OK); return; }
@@ -263,7 +263,7 @@ test('the recovery sequence confirms, repairs, verifies, then writes text', asyn
 
   assert.equal(page.statusText(), 'Write OK. Disconnect and reconnect the unit to display the completed startup text.');
   assert.equal(page.context.confirmCalls.length, 1);
-  assert.match(page.context.confirmCalls[0], /Line 1 and 2|Lines 1 and 2/);
+  assert.match(page.context.confirmCalls[0], /unverified or customised startup layout/);
   assert.deepEqual(page.port.writes, [
     'INFO?\n', 'LAYOUT=DEFAULT\n', 'INFO?\n',
     'L1=ONE\n', 'L2=TWO\n', 'L3=THREE\n', 'L4=FOUR\n', 'SAVE\n', 'INFO?\n',
@@ -288,6 +288,80 @@ test('cancelling the overlap repair sends no EEPROM-modifying command', async ()
   assert.deepEqual(page.port.writes, ['INFO?\n']);
 });
 
+test('a customised v3.54 layout is recoverable only after confirmation', async () => {
+  const page = loadPage({
+    confirmResult: true,
+    onCommand: (command, port) => {
+      if (command === 'INFO?\n') {
+        const infoCalls = page.port.writes.filter(w => w === 'INFO?\n').length;
+        port.enqueue(infoCalls === 1 ? infoBlock({ positions: [1, 3, 5, 6] }) : infoBlock());
+        return;
+      }
+      port.enqueue(OK);
+    },
+  });
+  page.setLines(['ONE', 'TWO', 'THREE', 'FOUR']);
+
+  await page.context.writeStartup();
+
+  assert.equal(page.statusText(), 'Write OK. Disconnect and reconnect the unit to display the completed startup text.');
+  assert.deepEqual(page.port.writes, [
+    'INFO?\n', 'LAYOUT=DEFAULT\n', 'INFO?\n',
+    'L1=ONE\n', 'L2=TWO\n', 'L3=THREE\n', 'L4=FOUR\n', 'SAVE\n', 'INFO?\n',
+  ]);
+});
+
+test('missing recovery capability blocks markerless layouts without EEPROM writes', async () => {
+  const page = loadPage({
+    onCommand: (command, port) => {
+      if (command === 'INFO?\n') port.enqueue(infoBlock({ cap: 'NONE', layoutVersion: 0 }));
+    },
+  });
+  page.setLines(['ONE', 'TWO', 'THREE', 'FOUR']);
+
+  await page.context.writeStartup();
+
+  assert.equal(page.statusText(), 'This unit cannot confirm support for safe startup-layout recovery. No text was changed.');
+  assert.deepEqual(page.port.writes, ['INFO?\n']);
+});
+
+test('a failed recovery acknowledgement stops before text staging', async () => {
+  const page = loadPage({
+    confirmResult: true,
+    onCommand: (command, port) => {
+      if (command === 'INFO?\n') { port.enqueue(infoBlock({ layoutVersion: 0 })); return; }
+      if (command === 'LAYOUT=DEFAULT\n') { port.enqueue('ERR\r\n'); return; }
+      port.enqueue(OK);
+    },
+  });
+  page.setLines(['ONE', 'TWO', 'THREE', 'FOUR']);
+
+  await page.context.writeStartup();
+
+  assert.equal(page.statusText(), 'Startup-layout recovery failed: expected exactly one OK response');
+  assert.deepEqual(page.port.writes, ['INFO?\n', 'LAYOUT=DEFAULT\n']);
+});
+
+test('a failed post-recovery readback stops before text staging', async () => {
+  const page = loadPage({
+    confirmResult: true,
+    onCommand: (command, port) => {
+      if (command === 'INFO?\n') {
+        const infoCalls = page.port.writes.filter(w => w === 'INFO?\n').length;
+        port.enqueue(infoCalls === 1 ? infoBlock({ layoutVersion: 0 }) : infoBlock({ positions: [0, 0, 4, 6] }));
+        return;
+      }
+      port.enqueue(OK);
+    },
+  });
+  page.setLines(['ONE', 'TWO', 'THREE', 'FOUR']);
+
+  await page.context.writeStartup();
+
+  assert.equal(page.statusText(), 'Startup-layout recovery could not be verified. No text was changed.');
+  assert.deepEqual(page.port.writes, ['INFO?\n', 'LAYOUT=DEFAULT\n', 'INFO?\n']);
+});
+
 test('a mismatched post-SAVE INFO response is not reported as success', async () => {
   const page = loadPage({
     onCommand: (command, port) => {
@@ -307,6 +381,24 @@ test('a mismatched post-SAVE INFO response is not reported as success', async ()
   assert.deepEqual(page.port.writes, [
     'INFO?\n', 'L1=ONE\n', 'L2=TWO\n', 'L3=THREE\n', 'L4=FOUR\n', 'SAVE\n', 'INFO?\n',
   ]);
+});
+
+test('a post-SAVE layout regression is not reported as success', async () => {
+  const page = loadPage({
+    onCommand: (command, port) => {
+      if (command === 'INFO?\n') {
+        const infoCalls = page.port.writes.filter(write => write === 'INFO?\n').length;
+        port.enqueue(infoCalls === 1 ? infoBlock() : infoBlock({ layoutVersion: 0 }));
+        return;
+      }
+      port.enqueue(OK);
+    },
+  });
+  page.setLines(['ONE', 'TWO', 'THREE', 'FOUR']);
+
+  await page.context.writeStartup();
+
+  assert.equal(page.statusText(), 'Saved startup layout could not be verified after the text update');
 });
 
 test('a failed SAVE stops before verification and never reports success', async () => {

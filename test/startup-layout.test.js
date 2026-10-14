@@ -14,19 +14,20 @@ function info({ positions = [0, 2, 4, 6], cap, fw = '3.53', screen = 1, layoutVe
   return `${fields.join('\r\n')}\r\nEND\r\n`;
 }
 
-test('standard 0,2,4,6 layouts from v3.53 and v3.54 are editable', () => {
-  assert.equal(assessLayout(parseInfo(info({ fw: '3.53' }))).kind, 'standard');
-  assert.equal(assessLayout(parseInfo(info({ fw: '3.54', cap: 'DEFAULT1' }))).kind, 'standard');
+test('only a verified standard layout is editable without recovery', () => {
+  assert.equal(assessLayout(parseInfo(info({ fw: '3.54', cap: 'DEFAULT1', layoutVersion: 1 }))).kind, 'standard');
+  assert.equal(assessLayout(parseInfo(info({ fw: '3.53' }))).kind, 'unsupported');
 });
 
-test('blank v3.54 layout can receive its first text, but markerless SCREEN=0 is blocked', () => {
+test('markerless v3.54 layouts are recoverable only with advertised capability', () => {
   assert.equal(assessLayout(parseInfo(info({ fw: '3.54', screen: 0, cap: 'DEFAULT1', layoutVersion: 1 }))).kind, 'standard');
-  assert.equal(assessLayout(parseInfo(info({ fw: '3.54', screen: 0, cap: 'DEFAULT1' }))).kind, 'invalid');
+  assert.equal(assessLayout(parseInfo(info({ fw: '3.54', screen: 0, cap: 'DEFAULT1' }))).kind, 'recoverable');
+  assert.equal(assessLayout(parseInfo(info({ fw: '3.54', screen: 0 }))).kind, 'unsupported');
 });
 
 test('repairable 0,0,4,6 layout repairs only after confirmation then writes text', async () => {
   const commands = [];
-  const responses = [parseInfo(info({ positions: [0, 0, 4, 6], cap: 'DEFAULT1' })), parseInfo(info())];
+  const responses = [parseInfo(info({ positions: [0, 0, 4, 6], cap: 'DEFAULT1', layoutVersion: 1 })), parseInfo(info({ cap: 'DEFAULT1', layoutVersion: 1 }))];
   const result = await runStartupTextUpdate({
     readInfo: async () => responses.shift(),
     confirmRepair: async () => true,
@@ -40,7 +41,7 @@ test('repairable 0,0,4,6 layout repairs only after confirmation then writes text
 test('cancelled overlap repair sends no EEPROM-changing commands', async () => {
   const commands = [];
   const result = await runStartupTextUpdate({
-    readInfo: async () => parseInfo(info({ positions: [0, 0, 4, 6], cap: 'DEFAULT1' })),
+    readInfo: async () => parseInfo(info({ positions: [0, 0, 4, 6], cap: 'DEFAULT1', layoutVersion: 1 })),
     confirmRepair: async () => false,
     repairLayout: async () => commands.push('LAYOUT=DEFAULT'),
     writeText: async () => commands.push('L1', 'SAVE'),
@@ -49,16 +50,16 @@ test('cancelled overlap repair sends no EEPROM-changing commands', async () => {
   assert.deepEqual(commands, []);
 });
 
-test('overlap without repair capability and customised layouts are blocked', async () => {
-  assert.equal(assessLayout(parseInfo(info({ positions: [0, 0, 4, 6] }))).kind, 'overlap-without-repair');
-  assert.equal(assessLayout(parseInfo(info({ positions: [1, 3, 5, 6], cap: 'DEFAULT1' }))).kind, 'custom');
+test('customised layouts recover only with advertised capability', async () => {
+  assert.equal(assessLayout(parseInfo(info({ positions: [0, 0, 4, 6] }))).kind, 'unsupported');
+  assert.equal(assessLayout(parseInfo(info({ positions: [1, 3, 5, 6], cap: 'DEFAULT1', layoutVersion: 1 }))).kind, 'recoverable');
   const commands = [];
   await assert.rejects(runStartupTextUpdate({
     readInfo: async () => parseInfo(info({ positions: [1, 3, 5, 6] })),
     confirmRepair: async () => true,
     repairLayout: async () => commands.push('LAYOUT=DEFAULT'),
     writeText: async () => commands.push('L1'),
-  }), /customised startup layout/);
+  }), /cannot confirm support/);
   assert.deepEqual(commands, []);
 });
 
@@ -71,13 +72,13 @@ test('missing, malformed, incomplete, and duplicated INFO fields are rejected', 
 
 test('failed post-repair verification stops before staged text commands', async () => {
   const commands = [];
-  const responses = [parseInfo(info({ positions: [0, 0, 4, 6], cap: 'DEFAULT1' })), parseInfo(info({ positions: [0, 0, 4, 6], cap: 'DEFAULT1' }))];
+  const responses = [parseInfo(info({ positions: [0, 0, 4, 6], cap: 'DEFAULT1', layoutVersion: 1 })), parseInfo(info({ positions: [0, 0, 4, 6], cap: 'DEFAULT1', layoutVersion: 1 }))];
   await assert.rejects(runStartupTextUpdate({
     readInfo: async () => responses.shift(),
     confirmRepair: async () => true,
     repairLayout: async () => commands.push('LAYOUT=DEFAULT'),
     writeText: async () => commands.push('L1', 'SAVE'),
-  }), /could not be verified/);
+  }), /recovery could not be verified/);
   assert.deepEqual(commands, ['LAYOUT=DEFAULT']);
 });
 
@@ -114,13 +115,14 @@ const OBSERVED_INFO_BODY = [
   'S3=0',
   'S4=0',
   'LAYOUT_CAP=DEFAULT1',
+  'LAYOUT_VER=1',
 ].join('\r\n');
 const OBSERVED_INFO_RESPONSE = `${OBSERVED_INFO_BODY}\r\nEND\r\n\u0000`;
 
 test('the exact observed END\\r\\n\\u0000 response parses as a standard layout', () => {
   // Reproduce the captured tail byte-for-byte (the firmware emits the string's
   // NUL terminator because it writes 6 bytes of "END\\r\\n").
-  assert.ok(OBSERVED_INFO_RESPONSE.endsWith('LAYOUT_CAP=DEFAULT1\r\nEND\r\n\u0000'));
+  assert.ok(OBSERVED_INFO_RESPONSE.endsWith('LAYOUT_CAP=DEFAULT1\r\nLAYOUT_VER=1\r\nEND\r\n\u0000'));
   assert.equal(isCompleteInfoResponse(OBSERVED_INFO_RESPONSE), true);
   const info = parseInfo(OBSERVED_INFO_RESPONSE);
   assert.equal(info.l1, 'ONE');

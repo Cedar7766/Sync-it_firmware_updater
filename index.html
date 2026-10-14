@@ -78,7 +78,8 @@
   <p class="contactNote">Need help using the updater tool? Contact <a href="mailto:info@sync-it.co.uk">info@sync-it.co.uk</a>.</p>
 
   <script src="avrbro.browser.js?v=d7bec8f"></script>
-  <script src="startup-layout.js?v=e14bb81a"></script>
+  <script src="startup-layout.js?v=e14cc01"></script>
+  <script src="firmware-selection.js?v=selection-20261008"></script>
   <script>
     const selector = document.getElementById('firmwareSelector');
     const uploadBtn = document.getElementById('uploadBtn');
@@ -562,6 +563,12 @@
       }
     }
 
+    function verifySavedStartupLayout(info) {
+      if (SyncItStartupLayout.assessLayout(info).kind !== 'standard') {
+        throw new Error('Saved startup layout could not be verified after the text update');
+      }
+    }
+
     async function requestStartupInfo(writer, reader) {
       const transactionStartedAt = performance.now();
       const preCommandDiagnostics = {};
@@ -668,12 +675,13 @@
           const result = await SyncItStartupLayout.runStartupTextUpdate({
             readInfo: () => requestStartupInfo(writer, reader),
             confirmRepair: async () => window.confirm([
-              'Lines 1 and 2 currently share the same vertical position.',
+              'This unit has an unverified or customised startup layout.',
               '',
               'Restore the standard startup positions (0, 2, 4, 6)?',
-              'This permanently changes the layout but preserves the current text, font, and letter spacing.',
+              'This permanently replaces the vertical positions before the new text is saved.',
+              'Existing text, font, and letter spacing are preserved during recovery.',
             ].join('\n')),
-            repairLayout: () => sendCommandExpectExactlyOneOk(writer, reader, 'LAYOUT=DEFAULT', 'Startup-layout repair'),
+            repairLayout: () => sendCommandExpectExactlyOneOk(writer, reader, 'LAYOUT=DEFAULT', 'Startup-layout recovery'),
             writeText: async () => {
               await sendCommandExpectOk(writer, reader, `L1=${line1}`, 'Line 1');
               await sendCommandExpectOk(writer, reader, `L2=${line2}`, 'Line 2');
@@ -685,6 +693,7 @@
 
           if (result.cancelled) return result;
           const verifiedInfo = await readStartupOverSerial(writer, reader);
+          verifySavedStartupLayout(verifiedInfo);
           verifySavedStartupText(verifiedInfo, [line1, line2, line3, line4]);
           return result;
         }, { readyDelayMs: APP_WRITE_READY_DELAY_MS });
@@ -759,15 +768,16 @@
           return;
         }
 
-        // 1. Get firmware contents
-        let firmwareText = "";
-        if (userFile) {
-          firmwareText = await userFile.text();
-        } else if (selectedFirmware) {
-          firmwareText = await fetch(selectedFirmware).then(r => r.text());
-        } else {
-          throw new Error("No firmware selected or uploaded");
-        }
+        // 1. Snapshot and read the chosen firmware before opening the port.
+        // The resulting hexText is the exact value later passed to flashHex().
+        const firmwarePayload = await SyncItFirmwareSelection.resolveFirmwareSelection({
+          userFile,
+          selectedFirmware,
+          fetchFirmware: fetch,
+          textEncoder,
+        });
+        const firmwareText = firmwarePayload.hexText;
+        console.info('Firmware payload selected for upload', firmwarePayload.diagnostics);
 
         const analysis = analyzeHex(firmwareText, { bootloaderStart: defaultBootloaderStart });
         let allowBootloaderOverwrite = false;
@@ -797,6 +807,7 @@
         console.info(`Programming with bootloader reset method: ${bootloader.method}`);
 
         // 3. Flash after the successful sync. Do not re-sync after the reset window.
+        console.info('Firmware payload passed to STK500 flashHex', firmwarePayload.diagnostics);
         const result = await bootloader.uploader.flashHex(
           firmwareText,
           pct => progress.value = pct,

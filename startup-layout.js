@@ -4,9 +4,9 @@
   if (root) root.SyncItStartupLayout = api;
 })(typeof window !== 'undefined' ? window : globalThis, function () {
   const STANDARD_POSITIONS = [0, 2, 4, 6];
-  const LEGACY_OVERLAP_POSITIONS = [0, 0, 4, 6];
   const REQUIRED_LINES = ['L1', 'L2', 'L3', 'L4'];
   const REQUIRED_LAYOUT_FIELDS = ['SCREEN', 'FONT', 'P1', 'P2', 'P3', 'P4', 'S1', 'S2', 'S3', 'S4'];
+  const DEFAULT_LAYOUT_CAPABILITY = 'DEFAULT1';
 
   function samePositions(actual, expected) {
     return actual.length === expected.length && actual.every((value, index) => value === expected[index]);
@@ -104,16 +104,25 @@
     if ((info.screen !== 0 && info.screen !== 1) || info.font === undefined || !info.positions || !info.spacing) {
       return { kind: 'invalid', message: 'The unit did not provide a complete startup-screen layout. No text was changed.' };
     }
-    if (info.screen === 0 && info.layoutVersion !== 1) {
-      return { kind: 'invalid', message: 'The unit has no verified startup-layout marker. No text was changed.' };
+    const canRestoreDefault = info.layoutCap === DEFAULT_LAYOUT_CAPABILITY;
+    const markerValid = info.layoutVersion === 1;
+    const positionsStandard = samePositions(info.positions, STANDARD_POSITIONS);
+
+    if (markerValid && positionsStandard) return { kind: 'standard' };
+
+    // DEFAULT1 is a capability advertisement, not a firmware-version guess.
+    // This keeps markerless v3.53 and unknown firmware outside the recovery path.
+    if (!canRestoreDefault) {
+      return {
+        kind: 'unsupported',
+        message: 'This unit cannot confirm support for safe startup-layout recovery. No text was changed.',
+      };
     }
-    if (samePositions(info.positions, STANDARD_POSITIONS)) return { kind: 'standard' };
-    if (samePositions(info.positions, LEGACY_OVERLAP_POSITIONS)) {
-      return info.layoutCap === 'DEFAULT1'
-        ? { kind: 'repairable-overlap' }
-        : { kind: 'overlap-without-repair', message: 'Lines 1 and 2 share a vertical position, but this firmware cannot safely repair the layout. No text was changed.' };
+
+    if (!markerValid) {
+      return { kind: 'recoverable', reason: 'unverified-marker' };
     }
-    return { kind: 'custom', message: 'This unit has a customised startup layout. Automatic text editing is unavailable until the layout is reviewed. No text was changed.' };
+    return { kind: 'recoverable', reason: 'custom-positions' };
   }
 
   function isExactlyOneOk(text) {
@@ -127,7 +136,7 @@
       await writeText();
       return { repaired: false, cancelled: false };
     }
-    if (assessment.kind !== 'repairable-overlap') {
+    if (assessment.kind !== 'recoverable') {
       throw new Error(assessment.message);
     }
     if (!await confirmRepair()) return { repaired: false, cancelled: true };
@@ -135,7 +144,7 @@
     await repairLayout();
     assessment = assessLayout(await readInfo());
     if (assessment.kind !== 'standard') {
-      throw new Error('Startup-layout repair could not be verified. No text was changed.');
+      throw new Error('Startup-layout recovery could not be verified. No text was changed.');
     }
 
     await writeText();
